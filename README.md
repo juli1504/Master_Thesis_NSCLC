@@ -30,9 +30,9 @@ This repository does not contain the raw medical imaging data due to repository 
     ```text
     data/
     ├── raw/
-    │   ├── dicom/          # Place the "NSCLC Radiogenomics" folder here
-    │   ├── xml/            # Place the XML files here
-    │   └── clinical/       # Place the CSV file here
+    │   ├── dicom/          # "NSCLC Radiogenomics" folder
+    │   ├── xml/            # XML files
+    │   └── clinical/       # CSV file
     ```
 
 3.  **Run Mapping Script:**
