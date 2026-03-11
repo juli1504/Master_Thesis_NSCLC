@@ -58,11 +58,7 @@ The implementation is divided into three phases:
 ```text
 .
 ├── data/                    # Local directory for dataset (excluded from version control)
-├── notebooks/
-│   ├── 01_exploration/      # Initial data analysis scripts
-│   ├── 02_mapping/          # Scripts for linking data modalities
-│   └── 03_preprocessing/    # Pipelines for DICOM and XML processing
-├── src/                     # Source code for model architectures
+├── src/                     # Source code for initial data analysis, model architectures
 ├── results/                 # Evaluation metrics
 ├── requirements.txt         # Python dependencies
 └── README.md
