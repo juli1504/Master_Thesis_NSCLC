@@ -1,3 +1,12 @@
+"""
+Data Mapping and Master List Creation Script.
+
+This script aggregates clinical data, XML annotation files, and DICOM metadata
+to create a consolidated master list (`patient_overview.csv`). It performs 
+robust checks to ensure DICOM paths exist on the local disk and applies fixes 
+for known formatting issues in the TCIA metadata files.
+"""
+
 import pandas as pd
 import os
 from pathlib import Path
@@ -15,6 +24,21 @@ DIR_DICOM_ROOT = DIR_RAW / "dicom"
 PATH_OUTPUT = PROJECT_ROOT / "data" / "processed" / "patient_overview.csv"
 
 def main():
+    """
+    Executes the data mapping pipeline to create a master patient overview.
+
+    The function performs the following steps:
+    1. Loads clinical data to retrieve base 'Subject ID' and 'Histology'.
+    2. Scans the local XML directory to identify which patients have annotations.
+    3. Loads DICOM metadata, corrects potential column shifts (where UIDs are 
+       listed instead of Subject IDs), and verifies the physical existence of 
+       the DICOM directories on the hard drive.
+    4. Merges clinical, XML, and DICOM data into a single master DataFrame.
+    5. Exports the compiled dataset to 'patient_overview.csv'.
+
+    Returns:
+        None. The result is written to PATH_OUTPUT.
+    """
     print(f"--- Start Data Mapping (Robust Mode) ---")
     
     # 1. CLINICAL DATA
@@ -44,6 +68,15 @@ def main():
     df_ct = df_meta[df_meta['Modality'].str.contains('CT', na=False)].copy()
     
     def check_path_exists(path_str):
+        """
+        Validates if a DICOM directory exists on the local file system.
+
+        Args:
+            path_str (str): The relative path string from the metadata.
+
+        Returns:
+            bool: True if the directory exists locally, False otherwise.
+        """
         if pd.isna(path_str): return False
         clean_path_str = path_str.lstrip('./').lstrip('.\\').replace('\\', os.sep).replace('/', os.sep)
         full_path = DIR_DICOM_ROOT / clean_path_str
@@ -56,12 +89,24 @@ def main():
     # Fix: If the IDs in the metadata are UIDs, we extract the ID from the path
     if len(available_ct_ids) > 0 and str(available_ct_ids[0]).startswith('1.3.6.'):
         print("Extracting patient IDs from folder paths...")
+        
         def extract_id(path_str):
+            """
+            Extracts the standard patient ID (e.g., 'AMC-001') from a folder path.
+
+            Args:
+                path_str (str): The raw directory path string.
+
+            Returns:
+                str: The extracted patient ID, or the original path string if no 
+                matching pattern ('AMC-' or 'R01-') is found.
+            """
             parts = path_str.replace('\\', '/').split('/')
             for p in parts:
                 if p.startswith('AMC-') or p.startswith('R01-'):
                     return p
             return path_str
+            
         available_ct_ids = df_ct[df_ct['Path_Exists'] == True]['File Location'].apply(extract_id).unique()
 
     df_dicom = pd.DataFrame({'Subject ID': available_ct_ids, 'Has_DICOM': True})

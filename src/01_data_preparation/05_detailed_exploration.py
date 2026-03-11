@@ -1,3 +1,13 @@
+"""
+Detailed CT Volume Analysis and Visualization Script.
+
+This script performs an in-depth exploratory data analysis (EDA) on a 
+single patient's full 3D CT scan. It demonstrates core medical imaging 
+preprocessing techniques, including loading DICOM series, anatomical Z-axis 
+sorting, mathematical conversion to Hounsfield Units (HU), and diagnostic 
+radiological windowing. It generates and saves several visual diagnostic plots.
+"""
+
 import pydicom
 import numpy as np
 import matplotlib.pyplot as plt
@@ -13,7 +23,19 @@ DIR_FIGURES = PROJECT_ROOT / "results" / "figures"
 DIR_FIGURES.mkdir(parents=True, exist_ok=True)
 
 def load_scan(path):
-    """Loads all DICOM files from a folder and sorts them spatially (Z-axis)."""
+    """
+    Loads all DICOM files from a specified folder and sorts them spatially.
+
+    The function reads all '.dcm' files in the directory and sorts the list 
+    based on the 'ImagePositionPatient[2]' DICOM header attribute. This ensures 
+    the 2D slices are stacked in the correct anatomical order along the Z-axis.
+
+    Args:
+        path (Path or str): The directory path containing the DICOM files.
+
+    Returns:
+        list of pydicom.dataset.FileDataset: A spatially sorted list of DICOM objects.
+    """
     # 1. List all files
     slices = [pydicom.dcmread(path / f) for f in os.listdir(path) if f.endswith('.dcm')]
     
@@ -24,7 +46,21 @@ def load_scan(path):
     return slices
 
 def get_pixels_hu(slices):
-    """Converts raw pixel values to Hounsfield Units (HU)."""
+    """
+    Converts raw DICOM pixel values to a 3D numpy array of Hounsfield Units (HU).
+
+    This function applies the linear transformation defined in the DICOM header 
+    (RescaleIntercept and RescaleSlope) to convert arbitrary scanner pixel 
+    values into standardized radiodensity metrics (Hounsfield Units). It also 
+    normalizes out-of-bounds scanner padding (often -2000) to 0 (Air).
+
+    Args:
+        slices (list of pydicom.dataset.FileDataset): Spatially sorted DICOM objects.
+
+    Returns:
+        numpy.ndarray: A 3D array of shape (Slices, Rows, Columns) containing 
+        the calculated HU values as 16-bit integers.
+    """
     image = np.stack([s.pixel_array for s in slices])
     image = image.astype(np.int16)
 
@@ -44,7 +80,21 @@ def get_pixels_hu(slices):
     return np.array(image, dtype=np.int16)
 
 def apply_window(image, center, width):
-    """Applies CT windowing (similar to contrast/brightness)."""
+    """
+    Applies radiological CT windowing to restrict the visible HU range.
+
+    Windowing acts as a contrast/brightness adjustment, clipping the HU values 
+    to a specific range defined by a Window Center (Level) and Window Width. 
+    This highlights specific tissues, such as lung parenchyma or mediastinal soft tissue.
+
+    Args:
+        image (numpy.ndarray): The input 2D or 3D image array in Hounsfield Units.
+        center (int): The center value (Level) of the window in HU.
+        width (int): The width of the window in HU.
+
+    Returns:
+        numpy.ndarray: The windowed (clipped) image array.
+    """
     img_min = center - width // 2
     img_max = center + width // 2
     
@@ -52,6 +102,21 @@ def apply_window(image, center, width):
     return windowed
 
 def main():
+    """
+    Executes the detailed CT volume analysis and visualization pipeline.
+
+    The function performs the following steps on a sample patient:
+    1. Determines the physical DICOM directory path from the mapping file.
+    2. Loads the full 3D scan and converts it to Hounsfield Units (HU).
+    3. Generates a histogram illustrating the global HU density distribution.
+    4. Extracts the middle slice and visualizes it under three conditions: 
+       Raw HU, Lung Window, and Mediastinal Window.
+    5. Creates a 4x4 overview montage (grid) of evenly spaced slices across 
+       the entire Z-axis using the Lung Window.
+
+    Returns:
+        None. All visualizations are saved to the 'results/figures' directory.
+    """
     print("### STEP 3: DETAILED CT ANALYSIS (WINDOWING & 3D) ###")
     
     # 1. Get patient path

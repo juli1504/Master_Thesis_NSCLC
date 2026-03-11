@@ -1,3 +1,13 @@
+"""
+XML UID Extraction and DICOM Mapping Script.
+
+This script parses AIM v4 XML annotation files to extract the exact 
+'SeriesInstanceUID' used by the radiologist. It then matches these UIDs 
+against the dataset's 'metadata.csv' to locate the corresponding physical 
+DICOM directories on the local file system. It includes a specific fix 
+for parsing errors caused by shifted columns in the TCIA metadata file.
+"""
+
 import xml.etree.ElementTree as ET
 from pathlib import Path
 import pandas as pd
@@ -9,6 +19,20 @@ DIR_XML = PROJECT_ROOT / "data" / "raw" / "xml"
 PATH_METADATA = PROJECT_ROOT / "data" / "raw" / "metadata.csv"
 
 def extract_series_uid_robust(xml_path):
+    """
+    Parses an XML file to robustly extract the SeriesInstanceUID.
+
+    This function navigates the XML tree, handling potential XML namespace 
+    inconsistencies by stripping them out, to find the 'imageSeries' node 
+    and its underlying 'instanceUid'.
+
+    Args:
+        xml_path (Path): The file path to the AIM v4 XML annotation file.
+
+    Returns:
+        str or None: The extracted Series UID string if successfully found, 
+        otherwise None.
+    """
     try:
         tree = ET.parse(xml_path)
         root = tree.getroot()
@@ -25,6 +49,21 @@ def extract_series_uid_robust(xml_path):
     return None
 
 def main():
+    """
+    Executes the XML parsing and DICOM metadata matching pipeline.
+
+    The function performs the following operations:
+    1. Iterates through all XML files in the raw data directory.
+    2. Extracts the target Series UID from each XML file.
+    3. Loads the 'metadata.csv' and applies a fix for a known issue where 
+       Pandas incorrectly sets the UID column as the DataFrame index.
+    4. Merges the extracted XML UIDs with the fixed metadata to find the 
+       correct local folder paths ('File Location').
+    5. Saves the successfully mapped records to 'exact_image_mapping.csv'.
+
+    Returns:
+        None. The mapping result is exported to disk.
+    """
     print("Starting robust XML deep scan (AIM v4)...")
     
     xml_files = list(DIR_XML.glob("*.xml"))

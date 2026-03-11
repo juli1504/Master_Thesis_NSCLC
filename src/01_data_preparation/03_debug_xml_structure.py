@@ -1,3 +1,12 @@
+"""
+XML Structure Debugging Script.
+
+This script acts as a simple utility to read and print the first 50 lines
+of the first available XML annotation file in the raw data directory. It is 
+used for quick visual inspection of the raw AIM v4 XML schema, tags, and 
+namespaces without actually parsing it into an ElementTree.
+"""
+
 from pathlib import Path
 
 # Adjust path

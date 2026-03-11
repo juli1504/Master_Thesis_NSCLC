@@ -1,3 +1,12 @@
+"""
+Initial Data Exploration and Visualization Script.
+
+This script performs basic exploratory data analysis (EDA) on the curated 
+dataset. It generates a distribution plot of the clinical diagnoses (histology), 
+extracts semantic features from a sample patient's XML annotation, and 
+visualizes a middle slice of their 3D CT volume using Matplotlib.
+"""
+
 import pandas as pd
 import pydicom
 import matplotlib.pyplot as plt
@@ -18,7 +27,19 @@ DIR_FIGURES = PROJECT_ROOT / "results" / "figures"
 DIR_FIGURES.mkdir(parents=True, exist_ok=True)
 
 def print_xml_features(xml_path):
-    """Reads semantic features from the XML."""
+    """
+    Extracts and prints semantic observation characteristics from an AIM v4 XML file.
+
+    This function parses the XML tree to locate 'ImagingObservationCharacteristic' 
+    nodes, extracting their nested label and value codes. This provides human-readable 
+    features (e.g., 'Margin', 'Spiculation') annotated by the radiologist.
+
+    Args:
+        xml_path (Path): The file path to the patient's XML annotation file.
+
+    Returns:
+        None. The extracted features are printed to standard output.
+    """
     try:
         tree = ET.parse(xml_path)
         root = tree.getroot()
@@ -49,6 +70,20 @@ def print_xml_features(xml_path):
         print(f"Error reading XML: {e}")
 
 def main():
+    """
+    Executes the initial data exploration pipeline.
+
+    The function performs three main steps:
+    1. Reads the clinical labels CSV, calculates the distribution of diagnoses 
+       (histology), and saves a bar chart visualization.
+    2. Selects the first valid patient from the image mapping file and prints 
+       their structured XML features using `print_xml_features()`.
+    3. Locates the patient's physical DICOM directory, loads the middle slice 
+       of the CT scan, and saves a 2D plot of the slice.
+
+    Returns:
+        None. Generated plots are saved to the 'results/figures' directory.
+    """
     print("### STEP 2: INITIAL DATA EXPLORATION ###\n")
     
     # 1. LABEL DISTRIBUTION (CSV)
