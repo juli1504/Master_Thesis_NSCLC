@@ -173,25 +173,25 @@ def main():
     
     # --- 3. THE EXPERIMENT GRIDS WITH PIPELINES (Prevents Leakage) ---
     models = {
-        "Tuned Logistic Regression": (
+        "Tuned Logistic Regression (Optuna)": (
             ImbPipeline([
                 ('smote', SMOTE(random_state=42)),
                 ('clf', LogisticRegression(random_state=42, class_weight='balanced', solver='liblinear'))
             ]),
             {
-                'clf__C': [0.01, 0.1, 1.0, 10.0, 100.0],  
-                'clf__penalty': ['l1', 'l2'] 
+                'clf__C': [0.088987],
+                'clf__penalty': ['l2']
             }
         ),
-        "Tuned MLP (Neural Net)": (
+        "Tuned MLP (Optuna)": (
             ImbPipeline([
                 ('smote', SMOTE(random_state=42)),
                 ('clf', MLPClassifier(max_iter=1000, random_state=42))
             ]), 
             {
-                'clf__hidden_layer_sizes': [(16,), (32, 16), (64, 32), (128, 64, 32)],
-                'clf__learning_rate_init': [0.001, 0.01, 0.05, 0.1],
-                'clf__alpha': [0.0001, 0.001, 0.01, 0.1] 
+                'clf__hidden_layer_sizes': [(16,)],
+                'clf__learning_rate_init': [0.000287],
+                'clf__alpha': [0.000231]
             }
         ),
         "Tuned XGBoost (Optuna)": (
@@ -200,13 +200,11 @@ def main():
                 ('clf', XGBClassifier(eval_metric='logloss', random_state=42))
             ]), 
             {
-                # We feed the winning Optuna parameters as single-item lists.
-                # GridSearchCV will run exactly 1 trial for XGBoost using these perfect settings.
-                'clf__n_estimators': [236],
+                'clf__n_estimators': [121],
                 'clf__max_depth': [4],
-                'clf__learning_rate': [0.00134956],
-                'clf__subsample': [0.644139],
-                'clf__colsample_bytree': [0.529792],
+                'clf__learning_rate': [0.005335],
+                'clf__subsample': [0.666782],
+                'clf__colsample_bytree': [0.662423],
                 'clf__min_child_weight': [1]
             }
         )
