@@ -194,16 +194,20 @@ def main():
                 'clf__alpha': [0.0001, 0.001, 0.01, 0.1] 
             }
         ),
-        "Tuned XGBoost": (
+        "Tuned XGBoost (Optuna)": (
             ImbPipeline([
                 ('smote', SMOTE(random_state=42)),
                 ('clf', XGBClassifier(eval_metric='logloss', random_state=42))
             ]), 
             {
-                'clf__max_depth': [2, 3, 5, 7, 10], 
-                'clf__learning_rate': [0.01, 0.05, 0.1, 0.4, 0.7],
-                'clf__n_estimators': [50, 100, 150, 200, 300, 500],
-                'clf__subsample': [0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0] 
+                # We feed the winning Optuna parameters as single-item lists.
+                # GridSearchCV will run exactly 1 trial for XGBoost using these perfect settings.
+                'clf__n_estimators': [236],
+                'clf__max_depth': [4],
+                'clf__learning_rate': [0.00134956],
+                'clf__subsample': [0.644139],
+                'clf__colsample_bytree': [0.529792],
+                'clf__min_child_weight': [1]
             }
         )
     }
