@@ -97,28 +97,24 @@ def main():
     X_train = scaler.fit_transform(X_train_imputed)
     X_test = scaler.transform(X_test_imputed)
     
-    # --- 3. MODEL INITIALIZATION ---
+   # --- 3. MODEL INITIALIZATION ---
+    # We update the dictionary directly with the new weighted parameters
     models = {
         "Logistic Regression": LogisticRegression(random_state=42, class_weight='balanced'),
-        "Simple MLP (Neural Net)": MLPClassifier(hidden_layer_sizes=(32, 16), max_iter=1000, random_state=42),
-        "XGBoost": XGBClassifier(use_label_encoder=False, eval_metric='logloss', random_state=42)
+        "Simple MLP (Neural Net)": MLPClassifier(hidden_layer_sizes=(32, 16), max_iter=1000, random_state=42), # No native class_weight in sklearn MLP
+        "XGBoost": XGBClassifier(use_label_encoder=False, eval_metric='logloss', scale_pos_weight=5.35, random_state=42)
     }
     
     # --- 4. TRAINING & EVALUATION ---
     results = []
-    print("Applying SMOTE upsampling to the Training Set...")
     
-    # Apply SMOTE but only to training data
-    smote = SMOTE(random_state=42)
-    X_train_balanced, y_train_balanced = smote.fit_resample(X_train, y_train)
+    # We print the original imbalanced shape to prove SMOTE is off
+    print(f"Original training shape (Imbalanced): {np.bincount(y_train)}")
     
-    print(f"Original training shape: {np.bincount(y_train)}")
-    print(f"Balanced training shape: {np.bincount(y_train_balanced)}")
-    
-    print("\nTraining models on balanced data...")
+    print("\nTraining models on strictly imbalanced data with weighted loss...")
     for name, model in models.items():
-        # Train the model on the BALANCED data
-        model.fit(X_train_balanced, y_train_balanced)
+        # Train the model on the ORIGINAL unbalanced data
+        model.fit(X_train, y_train)
         
         # Evaluate on the UNBALANCED, real-world Test data
         metrics = evaluate_model(name, model, X_test, y_test)
@@ -127,7 +123,7 @@ def main():
         
     # --- 5. DISPLAY RESULTS ---
     print("\n" + "="*70)
-    print("PHASE 1 RESULTS: PURE CLINICAL DATA (Age, Gender, Smoking)")
+    print("PHASE 1a ABLATION: CLINICAL DATA (No SMOTE, Weighted Loss)")
     print("="*70)
     results_df = pd.DataFrame(results)
     print(results_df.to_string(index=False))
