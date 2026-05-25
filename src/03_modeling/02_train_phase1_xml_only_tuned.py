@@ -8,6 +8,8 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
+import warnings
+
 from sklearn.preprocessing import StandardScaler, LabelEncoder, OrdinalEncoder
 from sklearn.impute import KNNImputer, SimpleImputer
 from sklearn.compose import ColumnTransformer
@@ -18,11 +20,15 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.neural_network import MLPClassifier
 from xgboost import XGBClassifier
 from tabpfn import TabPFNClassifier
-from sklearn.metrics import accuracy_score, roc_auc_score, confusion_matrix, f1_score, precision_recall_curve
+from sklearn.metrics import accuracy_score, roc_auc_score, f1_score, roc_curve
 from sklearn.calibration import calibration_curve
 from sklearn.model_selection import GridSearchCV
-import warnings
+from sklearn.utils import resample
+import joblib
+# This forces everything that uses joblib to run on a single core
+joblib.parallel_backend('sequential')
 
+warnings.filterwarnings('ignore')
 warnings.filterwarnings('ignore')
 
 # --- 1. CONFIGURATION ---
@@ -47,30 +53,31 @@ def plot_feature_importance(model, feature_names, filename):
 
 def evaluate_model_advanced(name, model, X_test, y_test, X_train, y_train):
     """
-    Advanced metrics suite: Binary support, Laplacian Baseline comparison,
-    Calibration verification, and Operating Point analysis.
+    Advanced metrics suite including operating point analysis and Laplacian baseline.
     """
     # 1. Predictions
     y_probs = model.predict_proba(X_test)
     y_pred = model.predict(X_test)
-    
-    # 2. Extract probability of positive class (Binary)
-    # y_probs is shape (n_samples, 2), we need column 1
     y_probs_pos = y_probs[:, 1]
     
-    # 3. Metrics
+    # 2. Performance Metrics
     f1_val = f1_score(y_test, y_pred)
     auc_val = roc_auc_score(y_test, y_probs_pos)
     
-    # 4. Laplacian Baseline (Smoothing alpha=1)
-    # Calculate frequency of class 1 in the balanced training set
+    # 3. FPR at Fixed TPR (Operating Point: 90% Sensitivity)
+    fpr, tpr, thresholds = roc_curve(y_test, y_probs_pos)
+    target_tpr = 0.90
+    # Find index closest to 0.90 TPR
+    idx = np.argmin(np.abs(tpr - target_tpr))
+    fixed_fpr = fpr[idx]
+    
+    # 4. Laplacian Baseline (Prior probability from training set)
     prior_pos = np.mean(y_train == 1)
     laplacian_probs = np.full(len(y_test), prior_pos)
     auc_baseline = roc_auc_score(y_test, laplacian_probs)
     
-    # 5. Calibration Error (Mean squared difference)
+    # 5. Calibration Error
     prob_true, prob_pred = calibration_curve(y_test, y_probs_pos, n_bins=5)
-    # Handle cases where some bins might be empty
     bin_diffs = (prob_true - prob_pred)**2
     calibration_score = np.mean(bin_diffs[~np.isnan(bin_diffs)])
     
@@ -78,8 +85,9 @@ def evaluate_model_advanced(name, model, X_test, y_test, X_train, y_train):
         "Model": name,
         "F1": f"{f1_val * 100:.1f}%",
         "AUC": f"{auc_val:.3f}",
+        "FPR@90%TPR": f"{fixed_fpr:.2f}",
         "Baseline AUC": f"{auc_baseline:.3f}",
-        "Calibration Error": f"{calibration_score:.4f}"
+        "Calib. Error": f"{calibration_score:.4f}"
     }
 
 def main():
@@ -94,10 +102,11 @@ def main():
     for col in num_features:
         df[col] = pd.to_numeric(df[col].replace(['Not Collected', 'Unknown', ' '], np.nan), errors='coerce')
     
+    # Update the OrdinalEncoder inside your preprocessor:
     preprocessor = ColumnTransformer(transformers=[
-        ('num', SklearnPipeline([('imputer', KNNImputer(n_neighbors=5)), ('scaler', StandardScaler())]), num_features),
-        ('cat', SklearnPipeline([('imputer', SimpleImputer(strategy='most_frequent')), ('encoder', OrdinalEncoder(handle_unknown='use_encoded_value', unknown_value=-1))]), cat_features)
-    ])
+    ('num', SklearnPipeline([('imputer', KNNImputer(n_neighbors=5)), ('scaler', StandardScaler())]), num_features),
+    ('cat', SklearnPipeline([('imputer', SimpleImputer(strategy='most_frequent')), ('encoder', OrdinalEncoder(handle_unknown='use_encoded_value', unknown_value=-999))]), cat_features)
+])
     
     X = df[num_features + cat_features]
     target_col = 'histology ' if 'histology ' in df.columns else 'Histology '
@@ -131,25 +140,29 @@ def main():
 
     # 2. Execution Loop
     results = []
-    for name, (model, param_grid) in models.items():
+    for name, (model, grid) in models.items():
         if name == "TabPFN":
-            # TabPFN handles its own prep, so we pass raw X_train
             model.fit(X_train, y_train)
-            results.append(evaluate_model_advanced(name, model, X_test, y_test, X_train, y_train))
+            best_model = model
         else:
-            # GridSearchCV models are wrapped in pipelines that include 'prep'
-            gs = GridSearchCV(model, param_grid, cv=3, scoring='roc_auc', n_jobs=-1)
+            # We use n_jobs=1 to prevent the Windows subprocess/wmic crash
+            gs = GridSearchCV(model, grid, cv=3, scoring='roc_auc', n_jobs=1)
             gs.fit(X_train, y_train)
             best_model = gs.best_estimator_
             
-            # Pass X_train_b/y_train_b here to ensure the baseline 
-            # reflects the distribution the model actually saw
-            results.append(evaluate_model_advanced(name, best_model, X_test, y_test, X_train_b, y_train_b))
-            
-            if name == "Tuned XGBoost":
-                plot_feature_importance(best_model, num_features + cat_features, "feature_importance_1b")
+        # Evaluation
+        res = evaluate_model_advanced(name, best_model, X_test, y_test, X_train_b, y_train_b)
+        
+        # Bootstrap CI (using single-threaded resample)
+        preds = best_model.predict(X_test)
+        scores = [f1_score(*resample(y_test, preds)) for _ in range(500)]
+        res["F1 95% CI"] = f"[{np.percentile(scores, 2.5):.2f}, {np.percentile(scores, 97.5):.2f}]"
+        results.append(res)
+        
+        if name == "Tuned XGBoost": 
+            plot_feature_importance(best_model, num_features + cat_features, "feature_importance_1b")
 
-    print("\nPHASE 1b: FINAL CLINICAL BASELINE RESULTS (UNIFIED PREPROCESSING)")
+    print("\nFINAL CLINICAL BASELINE RESULTS")
     print(pd.DataFrame(results).to_string(index=False))
 
 if __name__ == "__main__":
