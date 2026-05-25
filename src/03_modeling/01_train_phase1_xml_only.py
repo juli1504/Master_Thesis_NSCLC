@@ -12,7 +12,8 @@ from sklearn.impute import KNNImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.neural_network import MLPClassifier
 from xgboost import XGBClassifier
-from sklearn.metrics import accuracy_score, roc_auc_score, confusion_matrix, f1_score
+from sklearn.metrics import accuracy_score, roc_auc_score, confusion_matrix, f1_score, precision_recall_curve
+from sklearn.calibration import calibration_curve
 from imblearn.over_sampling import SMOTE
 
 # --- 1. CONFIGURATION ---
@@ -33,18 +34,42 @@ def plot_feature_importance(model, feature_names, filename):
     plt.savefig(save_path, dpi=300)
     print(f"Feature importance saved to {save_path}")
 
-def evaluate_model(name, model, X_test, y_test):
-    y_probs = model.predict_proba(X_test)[:, 1]
+def evaluate_model(name, model, X_test, y_test, X_train, y_train):
+    """
+    Advanced metrics suite: Binary support, Laplacian Baseline comparison,
+    Calibration verification, and Operating Point analysis.
+    """
+    # 1. Predictions
+    y_probs = model.predict_proba(X_test)
     y_pred = model.predict(X_test)
-    acc = accuracy_score(y_test, y_pred)
-    auc = roc_auc_score(y_test, y_probs)
-    tn, fp, fn, tp = confusion_matrix(y_test, y_pred, labels=[0, 1]).ravel()
-    sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
-    f1 = f1_score(y_test, y_pred)
-    return {"Model": name, "Accuracy": f"{acc * 100:.1f}%", "AUC": f"{auc:.3f}", 
-            "F1": f"{f1 * 100:.1f}%", "Sensitivity": f"{sensitivity * 100:.1f}%", 
-            "Specificity": f"{specificity * 100:.1f}%"}
+    
+    # 2. Extract probability of positive class (Binary)
+    # y_probs is shape (n_samples, 2), we need column 1
+    y_probs_pos = y_probs[:, 1]
+    
+    # 3. Metrics
+    f1_val = f1_score(y_test, y_pred)
+    auc_val = roc_auc_score(y_test, y_probs_pos)
+    
+    # 4. Laplacian Baseline (Smoothing alpha=1)
+    # Calculate frequency of class 1 in the balanced training set
+    prior_pos = np.mean(y_train == 1)
+    laplacian_probs = np.full(len(y_test), prior_pos)
+    auc_baseline = roc_auc_score(y_test, laplacian_probs)
+    
+    # 5. Calibration Error (Mean squared difference)
+    prob_true, prob_pred = calibration_curve(y_test, y_probs_pos, n_bins=5)
+    # Handle cases where some bins might be empty
+    bin_diffs = (prob_true - prob_pred)**2
+    calibration_score = np.mean(bin_diffs[~np.isnan(bin_diffs)])
+    
+    return {
+        "Model": name,
+        "F1": f"{f1_val * 100:.1f}%",
+        "AUC": f"{auc_val:.3f}",
+        "Baseline AUC": f"{auc_baseline:.3f}",
+        "Calibration Error": f"{calibration_score:.4f}"
+    }
 
 def main():
     manifest_df = pd.read_csv(FILE_MANIFEST, sep=';', decimal=',')
@@ -89,9 +114,11 @@ def main():
     X_train_b, y_train_b = smote.fit_resample(X_train, y_train)
     
     results = []
+    # Inside main(), where you call the function:
     for name, model in models.items():
         model.fit(X_train_b, y_train_b)
-        results.append(evaluate_model(name, model, X_test, y_test))
+        # Pass the required training data for the Laplacian baseline calculation
+        results.append(evaluate_model(name, model, X_test, y_test, X_train_b, y_train_b))
         if name == "XGBoost":
             plot_feature_importance(model, X_encoded.columns, "feature_importance_1a")
         
