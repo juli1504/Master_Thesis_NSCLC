@@ -29,43 +29,6 @@ from sklearn.metrics import accuracy_score, roc_auc_score, confusion_matrix, roc
 import warnings
 warnings.filterwarnings('ignore')
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-class FocalLoss(nn.Module):
-    """
-    Focal Loss pushes the model to focus on hard-to-classify examples (Squamous) 
-    and down-weights easy examples (Adenocarcinoma).
-    """
-    def __init__(self, alpha=None, gamma=2.0, reduction='mean'):
-        super(FocalLoss, self).__init__()
-        self.gamma = gamma
-        self.alpha = alpha # Optional: can pass a tensor of class weights e.g., torch.tensor([0.2, 0.8])
-        self.reduction = reduction
-
-    def forward(self, inputs, targets):
-        # Calculate standard Cross Entropy Loss
-        ce_loss = F.cross_entropy(inputs, targets, reduction='none')
-        
-        # Get the probability of the true class (pt)
-        pt = torch.exp(-ce_loss)
-        
-        # Apply the Focal Loss formula: (1 - pt)^gamma * CE_Loss
-        focal_loss = ((1 - pt) ** self.gamma * ce_loss)
-        
-        # Apply class weights if provided
-        if self.alpha is not None:
-            alpha_factor = self.alpha[targets]
-            focal_loss = alpha_factor * focal_loss
-            
-        if self.reduction == 'mean':
-            return focal_loss.mean()
-        elif self.reduction == 'sum':
-            return focal_loss.sum()
-        else:
-            return focal_loss
-
 # --- 1. CONFIGURATION & SEEDING ---
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 FILE_MANIFEST = PROJECT_ROOT / "data" / "processed" / "manifest.csv"
@@ -280,18 +243,16 @@ def main():
     print(f"Data Splits -> Train: {len(train_dataset)} | Val: {len(val_dataset)} | Test: {len(test_dataset)}\n")
 
     model = build_vision_model(args.model, args.unfreeze_blocks, in_channels).to(device)
-    #criterion = nn.CrossEntropyLoss()
-    # Setting gamma=2.0 is the standard paper recommendation for Focal Loss
-    criterion = FocalLoss(gamma=2.0)
+    criterion = nn.CrossEntropyLoss()
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = optim.Adam(trainable_params, lr=args.lr)
 
     save_name = f"best_{args.model}_unfrozen_{args.unfreeze_blocks}.pth"
 
     # --- TRAINING LOOP ---
-    best_clinical_score = 0.0
-    best_auc_tracker = 0.0
-    patience = 7
+    best_clinical_score = 0.0  
+    best_auc_tracker = 0.0     
+    patience = 7  
     patience_counter = 0
 
     for epoch in range(args.epochs):
