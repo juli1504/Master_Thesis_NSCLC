@@ -1,13 +1,14 @@
 """
-Phase 1: Global Baselines (Clinical Metadata Only)
-Updated to include: Age, Weight, Gender, Ethnicity, Smoking, Pack Years, Quit Year
+Phase 1a: Global Baselines (Enriched Clinical Metadata)
+This script evaluates baseline performance and generates feature importance plots.
 """
 
 import pandas as pd
 import numpy as np
+import matplotlib.pyplot as plt
 from pathlib import Path
 from sklearn.preprocessing import StandardScaler, LabelEncoder
-from sklearn.impute import KNNImputer, SimpleImputer
+from sklearn.impute import KNNImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.neural_network import MLPClassifier
 from xgboost import XGBClassifier
@@ -18,6 +19,19 @@ from imblearn.over_sampling import SMOTE
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 FILE_MANIFEST = PROJECT_ROOT / "data" / "processed" / "manifest.csv"
 FILE_CLINICAL = PROJECT_ROOT / "data" / "raw" / "clinical" / "NSCLCR01Radiogenomic_DATA_LABELS_2018-05-22_1500-shifted.csv"
+
+def plot_feature_importance(model, feature_names, filename):
+    """Saves a bar chart of XGBoost feature importance."""
+    importances = pd.Series(model.feature_importances_, index=feature_names)
+    plt.figure(figsize=(10, 6))
+    importances.nlargest(10).plot(kind='barh', color='skyblue')
+    plt.title(f"XGBoost Feature Importance")
+    plt.xlabel("Importance Score")
+    plt.tight_layout()
+    save_path = PROJECT_ROOT / "results" / "figures" / f"{filename}.png"
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(save_path, dpi=300)
+    print(f"Feature importance saved to {save_path}")
 
 def evaluate_model(name, model, X_test, y_test):
     y_probs = model.predict_proba(X_test)[:, 1]
@@ -33,61 +47,55 @@ def evaluate_model(name, model, X_test, y_test):
             "Specificity": f"{specificity * 100:.1f}%"}
 
 def main():
-    print("Loading manifest and clinical data...")
     manifest_df = pd.read_csv(FILE_MANIFEST, sep=';', decimal=',')
     clinical_df = pd.read_csv(FILE_CLINICAL)
     
     manifest_df = manifest_df[manifest_df['dataset_split'] != 'Excluded'].copy()
     df = pd.merge(manifest_df, clinical_df, left_on='subject_id', right_on='Case ID', how='inner')
     
-    # --- 2. PREPROCESSING ---
-    # Fix histology target (Check column name in df.columns)
-    target_col = 'histology ' if 'histology ' in df.columns else 'histology'
-    le = LabelEncoder()
-    df['target'] = le.fit_transform(df[target_col])
+    # Robust target detection
+    possible_names = ['histology ', 'Histology ', 'histology', 'Histology']
+    target_col = next((col for col in possible_names if col in df.columns), None)
+    df['target'] = LabelEncoder().fit_transform(df[target_col])
     
-    # Define all features
+    # Features
     num_cols = ['Age at Histological Diagnosis', 'Weight (lbs)', 'Pack Years', 'Quit Smoking Year']
     cat_cols = ['Gender', 'Ethnicity', 'Smoking status']
     
-    # Clean numeric data
     for col in num_cols:
         df[col] = pd.to_numeric(df[col].replace(['Not Collected', 'Unknown', ' '], np.nan), errors='coerce')
     
     X_raw = df[num_cols + cat_cols].copy()
     X_encoded = pd.get_dummies(X_raw, columns=cat_cols, drop_first=True)
     
-    # Split
     train_mask = df['dataset_split'] == 'Train'
     test_mask = df['dataset_split'] == 'Test'
     X_train_raw, y_train = X_encoded[train_mask], df.loc[train_mask, 'target']
     X_test_raw, y_test = X_encoded[test_mask], df.loc[test_mask, 'target']
     
-    # Impute and Scale
+    # Pipeline
     knn_imputer = KNNImputer(n_neighbors=5)
     scaler = StandardScaler()
+    X_train = scaler.fit_transform(knn_imputer.fit_transform(X_train_raw))
+    X_test = scaler.transform(knn_imputer.transform(X_test_raw))
     
-    X_train_imputed = knn_imputer.fit_transform(X_train_raw)
-    X_test_imputed = knn_imputer.transform(X_test_raw)
-    X_train = scaler.fit_transform(X_train_imputed)
-    X_test = scaler.transform(X_test_imputed)
-    
-    # --- 3. MODELING ---
     models = {
         "Logistic Regression": LogisticRegression(random_state=42, class_weight='balanced'),
         "Simple MLP": MLPClassifier(hidden_layer_sizes=(32, 16), max_iter=1000, random_state=42),
         "XGBoost": XGBClassifier(eval_metric='logloss', random_state=42)
     }
     
-    results = []
     smote = SMOTE(random_state=42)
     X_train_b, y_train_b = smote.fit_resample(X_train, y_train)
     
+    results = []
     for name, model in models.items():
         model.fit(X_train_b, y_train_b)
         results.append(evaluate_model(name, model, X_test, y_test))
+        if name == "XGBoost":
+            plot_feature_importance(model, X_encoded.columns, "feature_importance_1a")
         
-    print("\n" + "="*70 + "\nPHASE 1 RESULTS: ENRICHED CLINICAL DATA\n" + "="*70)
+    print("\n" + "="*70 + "\nPHASE 1a RESULTS: ENRICHED CLINICAL DATA\n" + "="*70)
     print(pd.DataFrame(results).to_string(index=False))
 
 if __name__ == "__main__":
