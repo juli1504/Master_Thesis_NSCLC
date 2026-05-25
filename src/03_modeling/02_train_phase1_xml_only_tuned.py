@@ -162,7 +162,9 @@ def main():
         if name == "Tuned XGBoost": 
             plot_feature_importance(best_model, num_features + cat_features, "feature_importance_1b")
 
-    print("\nFINAL CLINICAL BASELINE RESULTS")
+    print(f"\n{'='*70}")
+    print("PHASE 1b: FINAL CLINICAL BASELINE RESULTS (UNIFIED PREPROCESSING)")
+    print(f"{'='*70}")
     print(pd.DataFrame(results).to_string(index=False))
 
 if __name__ == "__main__":
