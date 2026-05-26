@@ -29,7 +29,6 @@ import joblib
 joblib.parallel_backend('sequential')
 
 warnings.filterwarnings('ignore')
-warnings.filterwarnings('ignore')
 
 # --- 1. CONFIGURATION ---
 PROJECT_ROOT = Path(__file__).parent.parent.parent
@@ -117,20 +116,25 @@ def main():
     X_train, y_train, X_test, y_test = X[train_mask], y[train_mask], X[test_mask], y[test_mask]
     
     models = {
-        "Tuned LR": (ImbPipeline([('prep', preprocessor), ('smote', SMOTE(random_state=42)), ('clf', LogisticRegression(random_state=42))]), {'clf__C': [0.1]}),
-        "Tuned XGBoost": (
-            ImbPipeline([
-                ('prep', preprocessor), 
-                ('smote', SMOTE(random_state=42)), 
-                ('clf', XGBClassifier(eval_metric='logloss', random_state=42))
-            ]), 
-            {
-                'clf__n_estimators': [100],
-                'clf__reg_alpha': [0.1, 1.0, 10.0],
-                'clf__reg_lambda': [0.1, 1.0, 10.0]
-            }
-        ),        "TabPFN": (SklearnPipeline([('prep', preprocessor), ('clf', TabPFNClassifier(device='cpu', model_path="03_modeling/tabpfn-v2.5-classifier-v2.5_default.ckpt"))]), {})
-    }
+    "Tuned LR": (ImbPipeline([('prep', preprocessor), ('smote', SMOTE(random_state=42)), ('clf', LogisticRegression(random_state=42))]), {'clf__C': [0.1]}),
+    "Tuned XGBoost": (
+        ImbPipeline([
+            ('prep', preprocessor), 
+            ('smote', SMOTE(random_state=42)), 
+            ('clf', XGBClassifier(eval_metric='logloss', random_state=42))
+        ]), 
+        {
+            'clf__n_estimators': [100],
+            'clf__reg_alpha': [0.1, 1.0, 10.0],
+            'clf__reg_lambda': [0.1, 1.0, 10.0]
+        }
+    ),
+    "TabPFN": (SklearnPipeline([('prep', preprocessor), ('clf', TabPFNClassifier(device='cpu', model_path="03_modeling/tabpfn-v2.5-classifier-v2.5_default.ckpt"))]), {}),
+    # Wrap this in a tuple so it matches the (model, grid) structure
+    "Tuned MLP": (
+        ImbPipeline([('prep', preprocessor), ('smote', SMOTE(random_state=42)), ('clf', MLPClassifier(hidden_layer_sizes=(64, 32), learning_rate_init=0.01, alpha=0.01, max_iter=1000, random_state=42))]), 
+        {}
+    )}
     
     # 1. Generate the balanced training set
     smote = SMOTE(random_state=42)
