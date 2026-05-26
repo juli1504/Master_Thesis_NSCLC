@@ -26,8 +26,48 @@ import torchvision.models as models
 import torchvision.transforms as T
 from sklearn.preprocessing import LabelEncoder
 from sklearn.metrics import accuracy_score, roc_auc_score, confusion_matrix, roc_curve, f1_score
+from sklearn.calibration import calibration_curve
+from sklearn.utils import resample
 import warnings
+import csv
 warnings.filterwarnings('ignore')
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class FocalLoss(nn.Module):
+    """
+    Focal Loss pushes the model to focus on hard-to-classify examples (Squamous) 
+    and down-weights easy examples (Adenocarcinoma).
+    """
+    def __init__(self, alpha=None, gamma=2.0, reduction='mean'):
+        super(FocalLoss, self).__init__()
+        self.gamma = gamma
+        self.alpha = alpha # Optional: can pass a tensor of class weights e.g., torch.tensor([0.2, 0.8])
+        self.reduction = reduction
+
+    def forward(self, inputs, targets):
+        # Calculate standard Cross Entropy Loss
+        ce_loss = F.cross_entropy(inputs, targets, reduction='none')
+        
+        # Get the probability of the true class (pt)
+        pt = torch.exp(-ce_loss)
+        
+        # Apply the Focal Loss formula: (1 - pt)^gamma * CE_Loss
+        focal_loss = ((1 - pt) ** self.gamma * ce_loss)
+        
+        # Apply class weights if provided
+        if self.alpha is not None:
+            alpha_factor = self.alpha[targets]
+            focal_loss = alpha_factor * focal_loss
+            
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss
 
 # --- 1. CONFIGURATION & SEEDING ---
 PROJECT_ROOT = Path(__file__).parent.parent.parent
@@ -149,44 +189,63 @@ def build_vision_model(model_name, unfreeze_blocks, in_channels, num_classes=2):
 
     return model
 
-# --- 4. EVALUATION FUNCTION (Youden's J STATISTIC + F1) ---
 def evaluate(model, dataloader, device):
     model.eval()
-    y_true = []
-    y_probs = []
-    
+    y_true, y_probs = [], []
     with torch.no_grad():
         for images, labels in dataloader:
             images, labels = images.to(device), labels.to(device)
             outputs = model(images)
             probs = torch.softmax(outputs, dim=1)[:, 1] 
-            
             y_true.extend(labels.cpu().numpy())
             y_probs.extend(probs.cpu().numpy())
-            
-    y_true = np.array(y_true)
-    y_probs = np.array(y_probs)
     
-    try:
-        auc = roc_auc_score(y_true, y_probs)
-    except ValueError:
-        auc = 0.5  
+    y_true, y_probs = np.array(y_true), np.array(y_probs)
     
+    # --- 1. Basic Metrics ---
     fpr, tpr, thresholds = roc_curve(y_true, y_probs)
-    youden_j = tpr - fpr
-    optimal_idx = np.argmax(youden_j)
+    optimal_idx = np.argmax(tpr - fpr)
     best_thresh = thresholds[optimal_idx]
-    
     y_pred = (y_probs >= best_thresh).astype(int)
     
     acc = accuracy_score(y_true, y_pred)
+    auc = roc_auc_score(y_true, y_probs) if len(np.unique(y_true)) > 1 else 0.5
     f1 = f1_score(y_true, y_pred)
-    
     tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
     sens = tp / (tp + fn) if (tp + fn) > 0 else 0.0
     spec = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+
+    # --- 2. Advanced Clinical Metrics with Safety Checks ---
+    # FPR @ 90% Sensitivity (TPR)
+    # If the model never hits 90% TPR, we set it to 1.0 (worst case)
+    idx_90 = np.argmin(np.abs(tpr - 0.90))
+    fpr_at_90 = fpr[idx_90] if len(fpr) > 0 else 1.0
     
-    return acc, auc, f1, sens, spec, best_thresh
+    # Expected Calibration Error (ECE)
+    # Binning can fail if y_probs are all identical
+    try:
+        prob_true, prob_pred = calibration_curve(y_true, y_probs, n_bins=5)
+        ece = np.mean(np.abs(prob_true - prob_pred))
+    except:
+        ece = 0.0
+    
+    # 95% Confidence Interval for F1 (Bootstrapping)
+    boot_f1s = []
+    for _ in range(100):
+        try:
+            t_b, p_b = resample(y_true, y_probs)
+            # Ensure p_b has enough variance to threshold
+            if len(np.unique(p_b)) > 1:
+                p_b_pred = (p_b >= best_thresh).astype(int)
+                boot_f1s.append(f1_score(t_b, p_b_pred))
+            else:
+                boot_f1s.append(0.0)
+        except:
+            boot_f1s.append(0.0)
+            
+    ci_low, ci_high = np.percentile(boot_f1s, [2.5, 97.5])
+    
+    return acc, auc, f1, sens, spec, best_thresh, fpr_at_90, ece, ci_low, ci_high
 
 # --- 5. MAIN SCRIPT ---
 def main():
@@ -243,16 +302,18 @@ def main():
     print(f"Data Splits -> Train: {len(train_dataset)} | Val: {len(val_dataset)} | Test: {len(test_dataset)}\n")
 
     model = build_vision_model(args.model, args.unfreeze_blocks, in_channels).to(device)
-    criterion = nn.CrossEntropyLoss()
+    #criterion = nn.CrossEntropyLoss()
+    # Setting gamma=2.0 is the standard paper recommendation for Focal Loss
+    criterion = FocalLoss(gamma=2.0)
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = optim.Adam(trainable_params, lr=args.lr)
 
     save_name = f"best_{args.model}_unfrozen_{args.unfreeze_blocks}.pth"
 
     # --- TRAINING LOOP ---
-    best_clinical_score = 0.0  
-    best_auc_tracker = 0.0     
-    patience = 7  
+    best_clinical_score = 0.0
+    best_auc_tracker = 0.0
+    patience = 7
     patience_counter = 0
 
     for epoch in range(args.epochs):
@@ -273,10 +334,9 @@ def main():
         epoch_loss = running_loss / len(train_loader.dataset)
         
         # Evaluate strictly on VALIDATION loader during training
-        val_acc, val_auc, val_f1, val_sens, val_spec, best_thresh = evaluate(model, val_loader, device)
+        val_acc, val_auc, val_f1, val_sens, val_spec, val_thresh, _, _, _, _ = evaluate(model, val_loader, device)        
         
-        print(f"Epoch {epoch+1} Loss: {epoch_loss:.4f} | Optimal Val Cutoff: {best_thresh:.2f} | Val AUC: {val_auc:.3f} | Val F1: {val_f1*100:.1f}% | Val Sens: {val_sens*100:.1f}% | Val Spec: {val_spec*100:.1f}%")
-
+        print(f"Epoch {epoch+1} Loss: {epoch_loss:.4f} | Optimal Val Cutoff: {val_thresh:.2f} | Val AUC: {val_auc:.3f} | Val F1: {val_f1*100:.1f}% | Val Sens: {val_sens*100:.1f}% | Val Spec: {val_spec*100:.1f}%")    
         # --- EARLY STOPPING & SAVING (BASED ON VAL SET) ---
         current_clinical_score = val_sens + val_spec
         
@@ -296,24 +356,32 @@ def main():
             break
 
     # --- FINAL TEST EVALUATION ---
-    print("\n" + "="*70)
-    print("PHASE 2 FINAL RESULTS: EVALUATING ON UNTOUCHED TEST SET")
-    print("="*70)
+    if os.path.exists(save_name):
+        model.load_state_dict(torch.load(save_name))
     
-    # Load the absolute best weights identified by the Validation set
-    model.load_state_dict(torch.load(save_name))
+    acc, auc, f1, sens, spec, thresh, fpr90, ece, ci_l, ci_h = evaluate(model, test_loader, device)
     
-    # Evaluate exactly once on pure Test set
-    test_acc, test_auc, test_f1, test_sens, test_spec, test_thresh = evaluate(model, test_loader, device)
+    # Save to master CSV
+    import csv
+    results_file = "all_phase2_benchmarks.csv"
+    row = {
+        "Architecture": args.model.upper(),
+        "Unfreeze": args.unfreeze_blocks,
+        "AUC": f"{auc:.3f}",
+        "F1": f"{f1*100:.1f}%",
+        "Sens": f"{sens*100:.1f}%",
+        "Spec": f"{spec*100:.1f}%",
+        "FPR@90": f"{fpr90:.3f}",
+        "ECE": f"{ece:.3f}",
+        "F1_CI": f"[{ci_l:.2f}, {ci_h:.2f}]"
+    }
     
-    print(f"Model: {args.model.upper()} | Unfrozen Blocks: {args.unfreeze_blocks}")
-    print(f"Optimal Test Cutoff: {test_thresh:.2f}")
-    print(f"Test Accuracy:    {test_acc*100:.1f}%")
-    print(f"Test F1-Score:    {test_f1*100:.1f}%")
-    print(f"Test AUC:         {test_auc:.3f}")
-    print(f"Test Sensitivity: {test_sens*100:.1f}%")
-    print(f"Test Specificity: {test_spec*100:.1f}%")
-    print("="*70)
+    file_exists = os.path.isfile(results_file)
+    with open(results_file, 'a', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=row.keys())
+        if not file_exists: writer.writeheader()
+        writer.writerow(row)
+    print(f"\nResult appended to {results_file}")
 
 if __name__ == "__main__":
     main()
