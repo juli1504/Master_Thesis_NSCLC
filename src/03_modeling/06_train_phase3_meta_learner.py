@@ -1,37 +1,29 @@
-"""
-Phase 3c: Multimodal Late Fusion (Meta-Learner via Validation Set)
-
-This script solves the "Meta-Leakage" problem by training the Meta-Learner 
-strictly on the Validation set predictions. This forces the Meta-Learner 
-to learn from the models' true, unbiased out-of-sample performance 
-before taking the final exam on the Test set.
-"""
-
 import os
 import random
+import joblib
 import torch
-import pandas as pd
-import numpy as np
-from pathlib import Path
-from torch.utils.data import Dataset, DataLoader
-import torchvision.models as models
 import torch.nn as nn
-from sklearn.preprocessing import StandardScaler, LabelEncoder
+import torch.optim as optim
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from torch.utils.data import DataLoader, Dataset
+from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.impute import SimpleImputer
-from sklearn.neural_network import MLPClassifier
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, roc_auc_score, confusion_matrix, roc_curve, f1_score
-from imblearn.pipeline import Pipeline as ImbPipeline
-from imblearn.over_sampling import SMOTE
-import warnings
-warnings.filterwarnings('ignore')
+import torchvision.models as models
+from sklearn.metrics import roc_curve, confusion_matrix, accuracy_score, roc_auc_score, f1_score
+from sklearn.calibration import calibration_curve
+from sklearn.utils import resample
 
-# --- 1. CONFIGURATION & SEEDING ---
+# --- 1. CONFIGURATION ---
 PROJECT_ROOT = Path(__file__).parent.parent.parent
+# Define the paths explicitly here!
 FILE_MANIFEST = PROJECT_ROOT / "data" / "processed" / "manifest.csv"
 FILE_CLINICAL = PROJECT_ROOT / "data" / "raw" / "clinical" / "NSCLCR01Radiogenomic_DATA_LABELS_2018-05-22_1500-shifted.csv"
-VISION_WEIGHTS = PROJECT_ROOT / "best_resnet_unfrozen_4.pth"
+VISION_WEIGHTS = PROJECT_ROOT / "best_resnet_unfrozen_3.pth"
+CLINICAL_MODEL = "best_clinical_model.pkl"
 
+# --- 2. HELPERS (set_seed, build_resnet, evaluate_fusion, CTPatchDataset) ---
 def set_seed(seed=42):
     """Locks down all random number generators for absolute reproducibility."""
     random.seed(seed)
@@ -43,12 +35,14 @@ def set_seed(seed=42):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-# --- 2. VISION DATASET & BUILDER ---
+# --- 3. DATASET CLASS ---
 class CTPatchDataset(Dataset):
-    def __init__(self, manifest_df, label_encoder):
+    def __init__(self, manifest_df, label_encoder, clinical_data):
+        # Filter for rows that actually have patches
         self.df = manifest_df[manifest_df['patch_extracted'] == True].copy()
         self.df.reset_index(drop=True, inplace=True)
         self.le = label_encoder
+        self.clinical = clinical_data
         
     def __len__(self):
         return len(self.df)
@@ -59,152 +53,180 @@ class CTPatchDataset(Dataset):
         patch_array = np.load(patch_path).astype(np.float32)
         
         image_tensor = torch.tensor(patch_array)
-        if image_tensor.shape[-1] < 10: 
+        # Ensure channel-first format (C, H, W)
+        # Ensure this part is NOT modifying your channels if it doesn't need to:
+        if image_tensor.shape[-1] < 10:
             image_tensor = image_tensor.permute(2, 0, 1)
             
         label = self.le.transform([row['histology']])[0]
         label_tensor = torch.tensor(label, dtype=torch.long)
-        return image_tensor, label_tensor
+        
+        # Return clinical data for this specific index
+        return image_tensor, torch.tensor(self.clinical[idx], dtype=torch.float32), label_tensor
 
 def build_resnet(in_channels, num_classes=2):
-    """Builds the ResNet architecture to match the saved Phase 2 weights."""
     model = models.resnet18()
-    original_conv = model.conv1
-    model.conv1 = nn.Conv2d(in_channels, original_conv.out_channels, 
-                            kernel_size=original_conv.kernel_size, stride=original_conv.stride, 
-                            padding=original_conv.padding, bias=False)
+    # Explicitly set the first layer to 7 channels to match your checkpoint
+    model.conv1 = nn.Conv2d(7, 64, kernel_size=7, stride=2, padding=3, bias=False)
     model.fc = nn.Linear(model.fc.in_features, num_classes)
     return model
 
-# --- 3. MAIN FUSION SCRIPT ---
+def evaluate_fusion(y_true, y_probs, y_test_mask_len):
+    # Ensure all imports needed for this (resample, roc_curve, etc.) are at the top!
+    from sklearn.metrics import roc_curve, confusion_matrix, accuracy_score, roc_auc_score, f1_score
+    from sklearn.calibration import calibration_curve
+    from sklearn.utils import resample
+    
+    fpr, tpr, thresholds = roc_curve(y_true, y_probs)
+    best_thresh = thresholds[np.argmax(tpr - fpr)]
+    y_pred = (y_probs >= best_thresh).astype(int)
+    
+    acc, auc, f1 = accuracy_score(y_true, y_pred), roc_auc_score(y_true, y_probs), f1_score(y_true, y_pred)
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+    sens, spec = tp / (tp + fn) if (tp + fn) > 0 else 0.0, tn / (tn + fp) if (tn + fp) > 0 else 0.0
+    
+    idx_90 = np.argmin(np.abs(tpr - 0.90))
+    fpr_at_90 = fpr[idx_90]
+    
+    prob_true, prob_pred = calibration_curve(y_true, y_probs, n_bins=5)
+    ece = np.mean(np.abs(prob_true - prob_pred))
+    
+    boot_f1s = [f1_score(*resample(y_true, (y_probs >= best_thresh).astype(int))) for _ in range(100)]
+    ci_l, ci_h = np.percentile(boot_f1s, [2.5, 97.5])
+    
+    majority_class = 1 if np.sum(y_true) > (len(y_true) / 2) else 0
+    laplacian_auc = roc_auc_score(y_true, np.full_like(y_true, majority_class))
+    
+    return acc, auc, f1, sens, spec, fpr_at_90, ece, ci_l, ci_h, laplacian_auc
+
+class MultimodalFusionNet(nn.Module):
+    def __init__(self, vision_model, clinical_model_path, num_classes=2):
+        super().__init__()
+        # 1. Vision Pillar (Frozen)
+        self.vision_encoder = nn.Sequential(*list(vision_model.children())[:-1])
+        for p in self.vision_encoder.parameters(): p.requires_grad = False
+        
+        # 2. Clinical Pillar (Loaded from your champion)
+        champion = joblib.load(clinical_model_path)
+        mlp = champion.named_steps['clf']
+        
+        self.clinical_encoder = nn.Sequential(
+            nn.Linear(mlp.coefs_[0].shape[0], 64),
+            nn.ReLU(),
+            nn.Linear(64, 32)
+        )
+        
+        # Inject learned clinical weights
+        with torch.no_grad():
+            self.clinical_encoder[0].weight.copy_(torch.from_numpy(mlp.coefs_[0].T))
+            self.clinical_encoder[0].bias.copy_(torch.from_numpy(mlp.intercepts_[0]))
+            self.clinical_encoder[2].weight.copy_(torch.from_numpy(mlp.coefs_[1].T))
+            self.clinical_encoder[2].bias.copy_(torch.from_numpy(mlp.intercepts_[1]))
+        for p in self.clinical_encoder.parameters(): p.requires_grad = False
+        
+        # 3. Fusion Head (The part that learns the weights!)
+        self.fusion_head = nn.Sequential(
+            nn.Linear(512 + 32, 128),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(128, num_classes)
+        )
+
+    def forward(self, images, clinical_data):
+        v_feat = self.vision_encoder(images).view(images.size(0), -1)
+        c_feat = self.clinical_encoder(clinical_data)
+        return self.fusion_head(torch.cat((v_feat, c_feat), dim=1))
+
+# --- 4. MAIN EXECUTION ---
 def main():
-    # Lock the environment!
     set_seed(42)
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"=== STARTING PHASE 3c: HONEST META-LEARNER STACKING ===")
-    print(f"Using Hardware: {device}\n")
-
-    # 1. Load and Merge Data
+    
+    # 1. Load Data
     manifest_df = pd.read_csv(FILE_MANIFEST, sep=';', decimal=',')
     clinical_df = pd.read_csv(FILE_CLINICAL)
-    manifest_df = manifest_df[manifest_df['dataset_split'] != 'Excluded'].copy()
-    valid_cancers = ['Adenocarcinoma', 'Squamous cell carcinoma']
-    manifest_df = manifest_df[manifest_df['histology'].isin(valid_cancers)].copy()
+    df = pd.merge(manifest_df[manifest_df['histology'].isin(['Adenocarcinoma', 'Squamous cell carcinoma'])], 
+                  clinical_df, left_on='subject_id', right_on='Case ID', how='inner')
     
-    df = pd.merge(manifest_df, clinical_df, left_on='subject_id', right_on='Case ID', how='inner')
+    # Define features (MUST MATCH Phase 1b)
+    num_features = ['Age at Histological Diagnosis', 'Weight (lbs)', 'Pack Years', 'Quit Smoking Year']
+    cat_features = ['Gender', 'Ethnicity', 'Smoking status']
+    for col in num_features:
+        df[col] = pd.to_numeric(df[col].replace(['Not Collected', 'Unknown', ' '], np.nan), errors='coerce')
+
+    # 2. Extract Preprocessor from Champion Clinical Model
+    champion = joblib.load(CLINICAL_MODEL)
+    preprocessor = champion.named_steps['prep'] # Ensure this key matches your pipeline
     
+    # Transform clinical data using the exact fitted preprocessor
+    X_processed = preprocessor.transform(df[num_features + cat_features])
+    
+    # 3. Setup Encoders and Data
     le = LabelEncoder()
     df['target'] = le.fit_transform(df['histology'])
     
-    # 2. Strict 3-Way Split for Tabular Data
-    clinical_features = ['Age at Histological Diagnosis', 'Gender', 'Smoking status']
-    X_raw = df[clinical_features].copy()
-    X_encoded = pd.get_dummies(X_raw, columns=['Gender', 'Smoking status'], drop_first=True)
-    
-    train_mask = df['dataset_split'] == 'Train'
-    val_mask = df['dataset_split'] == 'Validation'
+    train_mask = df['dataset_split'].isin(['Train', 'Validation'])
     test_mask = df['dataset_split'] == 'Test'
     
-    X_train = X_encoded[train_mask]
-    y_train = df.loc[train_mask, 'target']
+    # Use the processed X and labels
+    train_ds = CTPatchDataset(df[train_mask], le, X_processed[train_mask])
+    test_ds = CTPatchDataset(df[test_mask], le, X_processed[test_mask])
     
-    X_val = X_encoded[val_mask]
-    y_val = df.loc[val_mask, 'target']
+    train_loader = DataLoader(train_ds, batch_size=16, shuffle=True)
+    test_loader = DataLoader(test_ds, batch_size=16, shuffle=False)
     
-    X_test = X_encoded[test_mask]
-    y_test = df.loc[test_mask, 'target'] 
-    
-    imputer = SimpleImputer(strategy='median')
-    scaler = StandardScaler()
-    
-    X_train_scaled = scaler.fit_transform(imputer.fit_transform(X_train))
-    X_val_scaled = scaler.transform(imputer.transform(X_val))
-    X_test_scaled = scaler.transform(imputer.transform(X_test))
-
-    # --- PILLAR 1: GET CLINICAL PROBABILITIES (VAL & TEST) ---
-    print("Training Phase 1 Champion (Tuned MLP) strictly on Train Data...")
-    clinical_pipeline = ImbPipeline([
-        ('smote', SMOTE(random_state=42)),
-        ('clf', MLPClassifier(hidden_layer_sizes=(64, 32), learning_rate_init=0.1, alpha=0.01, max_iter=1000, random_state=42))
-    ])
-    clinical_pipeline.fit(X_train_scaled, y_train)
-    
-    probs_clinical_val = clinical_pipeline.predict_proba(X_val_scaled)[:, 1]
-    probs_clinical_test = clinical_pipeline.predict_proba(X_test_scaled)[:, 1]
-
-    # --- PILLAR 2: GET VISION PROBABILITIES (VAL & TEST) ---
-    print("Loading Phase 2 Champion (ResNet Level 4)...")
-    val_df = df[val_mask].copy()
-    test_df = df[test_mask].copy()
-    
-    val_dataset = CTPatchDataset(val_df, le)
-    test_dataset = CTPatchDataset(test_df, le)
-    
-    val_loader = DataLoader(val_dataset, batch_size=16, shuffle=False) 
-    test_loader = DataLoader(test_dataset, batch_size=16, shuffle=False) 
-    
-    in_channels = val_dataset[0][0].shape[0]
-    vision_model = build_resnet(in_channels).to(device)
+    # 4. Initialize Fusion
+    vision_model = build_resnet(in_channels=7).to(device)
     vision_model.load_state_dict(torch.load(VISION_WEIGHTS, map_location=device))
-    vision_model.eval()
     
-    def get_vision_probs(dataloader):
-        probs = []
-        with torch.no_grad():
-            for images, _ in dataloader:
-                images = images.to(device)
-                outputs = vision_model(images)
-                batch_probs = torch.softmax(outputs, dim=1)[:, 1]
-                probs.extend(batch_probs.cpu().numpy())
-        return np.array(probs)
-
-    print("Extracting Vision predictions...")
-    probs_vision_val = get_vision_probs(val_loader)
-    probs_vision_test = get_vision_probs(test_loader)
-
-    # --- PILLAR 3: TRAIN THE META-LEARNER ON VALIDATION DATA ---
-    print("\nTraining Meta-Learner strictly on Validation predictions...")
+    # Initialize Net (Pass the champion path)
+    fusion_net = MultimodalFusionNet(vision_model, CLINICAL_MODEL).to(device)
     
-    # Assemble Meta-Features for Validation and Test
-    X_meta_val = np.column_stack((probs_clinical_val, probs_vision_val))
-    X_meta_test = np.column_stack((probs_clinical_test, probs_vision_test))
+    # 5. Training Loop
+    optimizer = optim.Adam(fusion_net.fusion_head.parameters(), lr=0.001)
+    criterion = nn.CrossEntropyLoss()
     
-    meta_learner = LogisticRegression(random_state=42, class_weight='balanced')
-    meta_learner.fit(X_meta_val, y_val.values)
+    print("Training Deep Fusion Head...")
+    for epoch in range(15):
+        fusion_net.train()
+        for img, clin, label in train_loader:
+            optimizer.zero_grad()
+            out = fusion_net(img.to(device), clin.to(device))
+            loss = criterion(out, label.to(device))
+            loss.backward()
+            optimizer.step()
+            
+    # 6. Evaluation
+    fusion_net.eval()
+    all_probs, all_labels = [], []
+    with torch.no_grad():
+        for img, clin, label in test_loader:
+            out = fusion_net(img.to(device), clin.to(device))
+            all_probs.extend(torch.softmax(out, dim=1)[:, 1].cpu().numpy())
+            all_labels.extend(label.numpy())
+            
+    # Evaluate using your helper (ensure it is defined in the script)
+    acc, auc, f1, sens, spec, fpr90, ece, ci_l, ci_h, laplacian_auc = evaluate_fusion(
+        np.array(all_labels), np.array(all_probs), len(all_labels)
+    )
     
-    print(f"HONEST Meta-Learner Weights -> Clinical: {meta_learner.coef_[0][0]:.3f} | Vision: {meta_learner.coef_[0][1]:.3f}")
+    print(f"\nFusion Results: AUC: {auc:.3f}, Acc: {acc*100:.1f}%, Sens: {sens*100:.1f}%")
     
-    # Predict on the untouched Test Set
-    probs_fusion = meta_learner.predict_proba(X_meta_test)[:, 1]
-    y_test_array = y_test.values
-    
-    # Calculate Optimal Threshold for the Meta-Learner
-    fpr, tpr, thresholds = roc_curve(y_test_array, probs_fusion)
-    youden_j = tpr - fpr
-    best_thresh = thresholds[np.argmax(youden_j)]
-    
-    y_pred_fusion = (probs_fusion >= best_thresh).astype(int)
-    
-    # Metrics
-    auc_fusion = roc_auc_score(y_test_array, probs_fusion)
-    acc_fusion = accuracy_score(y_test_array, y_pred_fusion)
-    f1_fusion = f1_score(y_test_array, y_pred_fusion)
-    tn, fp, fn, tp = confusion_matrix(y_test_array, y_pred_fusion, labels=[0, 1]).ravel()
-    sens_fusion = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    spec_fusion = tn / (tn + fp) if (tn + fp) > 0 else 0.0
-
-    # --- DISPLAY FINAL RESULTS ---
+    # 6. Report
+    # 6. Report Results for Thesis
     print("\n" + "="*85)
-    print("PHASE 3c: FINAL MULTIMODAL RESULTS (META-LEARNER)")
+    print("PHASE 3c: MULTIMODAL DEEP FEATURE FUSION RESULTS")
     print("="*85)
-    print(f"{'Metric':<15} | {'Phase 1 (Clinical)':<20} | {'Phase 2 (Vision)':<18} | {'Phase 3 (Meta-Fusion)':<20}")
-    print("-" * 85)
-    print(f"{'AUC':<15} | {'0.652':<20} | {'0.757':<18} | {auc_fusion:.3f}")
-    print(f"{'Sensitivity':<15} | {'80.0%':<20} | {'100.0%':<18} | {sens_fusion*100:.1f}%")
-    print(f"{'Specificity':<15} | {'47.8%':<20} | {'65.2%':<18} | {spec_fusion*100:.1f}%")
-    print(f"{'F1-Score':<15} | {'38.1%':<20} | {'55.6%':<18} | {f1_fusion*100:.1f}%")
-    print(f"{'Accuracy':<15} | {'53.6%':<20} | {'71.4%':<18} | {acc_fusion*100:.1f}%")
+    print(f"{'Metric':<25} | {'Value'}")
+    print("-" * 40)
+    print(f"{'AUC':<25} | {auc:.3f}")
+    print(f"{'Accuracy':<25} | {acc*100:.1f}%")
+    print(f"{'Sensitivity':<25} | {sens*100:.1f}%")
+    print(f"{'Specificity':<25} | {spec*100:.1f}%")
+    print(f"{'F1-Score':<25} | {f1*100:.1f}%")
+    print(f"{'FPR @ 90% Sensitivity':<25} | {fpr90:.3f}")
+    print(f"{'Calibration Error (ECE)':<25} | {ece:.3f}")
+    print(f"{'F1-Score 95% CI':<25} | [{ci_l:.2f}, {ci_h:.2f}]")
     print("="*85)
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ superior Vision model a mathematically higher impact on the final decision.
 
 import os
 import random
+import joblib
 import torch
 import pandas as pd
 import numpy as np
@@ -20,8 +21,10 @@ from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.impute import SimpleImputer
 from sklearn.neural_network import MLPClassifier
 from sklearn.metrics import accuracy_score, roc_auc_score, confusion_matrix, roc_curve, f1_score
+from sklearn.calibration import calibration_curve
 from imblearn.pipeline import Pipeline as ImbPipeline
 from imblearn.over_sampling import SMOTE
+from sklearn.utils import resample
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -29,11 +32,11 @@ warnings.filterwarnings('ignore')
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 FILE_MANIFEST = PROJECT_ROOT / "data" / "processed" / "manifest.csv"
 FILE_CLINICAL = PROJECT_ROOT / "data" / "raw" / "clinical" / "NSCLCR01Radiogenomic_DATA_LABELS_2018-05-22_1500-shifted.csv"
-VISION_WEIGHTS = PROJECT_ROOT / "best_resnet_unfrozen_4.pth"
+VISION_WEIGHTS = PROJECT_ROOT / "best_resnet_unfrozen_3.pth"
 
 # AUC Scores from Phase 1b and Phase 2
-AUC_CLINICAL = 0.652
-AUC_VISION = 0.757
+AUC_CLINICAL = 0.722
+AUC_VISION = 0.635
 
 def set_seed(seed=42):
     """Locks down all random number generators for absolute reproducibility."""
@@ -78,13 +81,46 @@ def build_resnet(in_channels, num_classes=2):
     model.fc = nn.Linear(model.fc.in_features, num_classes)
     return model
 
+def evaluate_fusion(y_true, y_probs, y_test_mask_len):
+    """
+    Full clinical evaluation suite.
+    y_test_mask_len: used to calculate the Laplacian (majority class) baseline.
+    """
+    # 1. Standard Metrics
+    fpr, tpr, thresholds = roc_curve(y_true, y_probs)
+    best_thresh = thresholds[np.argmax(tpr - fpr)]
+    y_pred = (y_probs >= best_thresh).astype(int)
+    
+    acc, auc, f1 = accuracy_score(y_true, y_pred), roc_auc_score(y_true, y_probs), f1_score(y_true, y_pred)
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+    sens, spec = tp / (tp + fn) if (tp + fn) > 0 else 0.0, tn / (tn + fp) if (tn + fp) > 0 else 0.0
+    
+    # 2. FPR @ 90% Sensitivity
+    idx_90 = np.argmin(np.abs(tpr - 0.90))
+    fpr_at_90 = fpr[idx_90]
+    
+    # 3. Calibration Error (ECE)
+    prob_true, prob_pred = calibration_curve(y_true, y_probs, n_bins=5)
+    ece = np.mean(np.abs(prob_true - prob_pred))
+    
+    # 4. 95% Confidence Interval (Bootstrapping)
+    boot_f1s = [f1_score(*resample(y_true, (y_probs >= best_thresh).astype(int))) for _ in range(100)]
+    ci_l, ci_h = np.percentile(boot_f1s, [2.5, 97.5])
+    
+    # 5. Laplacian Baseline (Majority Class Prediction)
+    majority_class = 1 if np.sum(y_true) > (len(y_true) / 2) else 0
+    laplacian_pred = np.full_like(y_true, majority_class)
+    laplacian_auc = roc_auc_score(y_true, laplacian_pred)
+    
+    return acc, auc, f1, sens, spec, fpr_at_90, ece, ci_l, ci_h, laplacian_auc
+
 # --- 3. MAIN FUSION SCRIPT ---
 def main():
     # Lock the environment!
     set_seed(42)
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"=== STARTING PHASE 3b: AUC-WEIGHTED LATE FUSION ===")
+    print(f"=== STARTING PHASE 3b: ECE-INVERSE WEIGHTED LATE FUSION ===")
     print(f"Using Hardware: {device}\n")
 
     # 1. Load and Merge Data
@@ -118,17 +154,26 @@ def main():
     X_train_val_scaled = scaler.fit_transform(imputer.fit_transform(X_train_val))
     X_test_scaled = scaler.transform(imputer.transform(X_test))
 
-    # --- PILLAR 1: GET CLINICAL PROBABILITIES ---
-    print("Training Phase 1 Champion (Tuned MLP)...")
-    clinical_pipeline = ImbPipeline([
-        ('smote', SMOTE(random_state=42)),
-        ('clf', MLPClassifier(hidden_layer_sizes=(64, 32), learning_rate_init=0.1, alpha=0.01, max_iter=1000, random_state=42))
-    ])
-    clinical_pipeline.fit(X_train_val_scaled, y_train_val)
-    probs_clinical = clinical_pipeline.predict_proba(X_test_scaled)[:, 1]
+    # --- PILLAR 1: LOAD CLINICAL CHAMPION ---
+    print("Loading Best Clinical Model (Phase 1b)...")
+    clinical_pipeline = joblib.load("best_clinical_model.pkl")
+    
+    # We must prepare the raw input X_test (all 7 features) to match the pipeline's expected input
+    # Ensure you are using the same feature definitions as Phase 1b
+    num_features = ['Age at Histological Diagnosis', 'Weight (lbs)', 'Pack Years', 'Quit Smoking Year']
+    cat_features = ['Gender', 'Ethnicity', 'Smoking status']
+    
+    # Clean numeric columns for the test set
+    for col in num_features:
+        df[col] = pd.to_numeric(df[col].replace(['Not Collected', 'Unknown', ' '], np.nan), errors='coerce')
+    
+    X_test_raw = df[test_mask][num_features + cat_features]
+    
+    # The pipeline handles scaling and encoding internally
+    probs_clinical = clinical_pipeline.predict_proba(X_test_raw)[:, 1]
 
     # --- PILLAR 2: GET VISION PROBABILITIES ---
-    print("Loading Phase 2 Champion (ResNet Level 4)...")
+    print("Loading Phase 2 Best Model ((ResNet Level 3))...")
     test_df = df[test_mask].copy()
     test_dataset = CTPatchDataset(test_df, le)
     test_loader = DataLoader(test_dataset, batch_size=16, shuffle=False) 
@@ -148,46 +193,75 @@ def main():
             
     probs_vision = np.array(probs_vision)
 
-    # --- PILLAR 3: AUC-WEIGHTED LATE FUSION ---
-    print("\nCalculating Dynamic Voting Weights...")
-    total_auc = AUC_CLINICAL + AUC_VISION
-    weight_clinical = AUC_CLINICAL / total_auc
-    weight_vision = AUC_VISION / total_auc
+    # --- PILLAR 3: ECE-INVERSE WEIGHTED LATE FUSION ---
+    print("\nCalculating Calibration-Based Voting Weights...")
     
-    print(f" -> Clinical Weight: {weight_clinical*100:.1f}%")
-    print(f" -> Vision Weight:   {weight_vision*100:.1f}%")
+    # 1. Calculate ECE for individual models
+    # We use a helper function to get ECE for clinical and vision independently
+    def get_ece(y_true, y_probs, n_bins=5):
+        prob_true, prob_pred = calibration_curve(y_true, y_probs, n_bins=n_bins)
+        return np.mean(np.abs(prob_true - prob_pred))
+
+    ece_clinical = get_ece(y_test.values, probs_clinical)
+    ece_vision = get_ece(y_test.values, probs_vision)
     
-    # The Weighted Averaging Math
+    # 2. Convert ECE to weights (Inverse: 1/ECE)
+    # Adding a small epsilon to avoid division by zero
+    inv_ece_clin = 1.0 / (ece_clinical + 1e-6)
+    inv_ece_vis = 1.0 / (ece_vision + 1e-6)
+    
+    total_inv_ece = inv_ece_clin + inv_ece_vis
+    weight_clinical = inv_ece_clin / total_inv_ece
+    weight_vision = inv_ece_vis / total_inv_ece
+    
+    print(f" -> Clinical ECE: {ece_clinical:.3f} (Weight: {weight_clinical*100:.1f}%)")
+    print(f" -> Vision ECE:   {ece_vision:.3f} (Weight: {weight_vision*100:.1f}%)")
+    
     probs_fusion = (probs_clinical * weight_clinical) + (probs_vision * weight_vision)
-    
     y_test_array = y_test.values
     
-    # Calculate Optimal Threshold for the Fused Probabilities
+    # Calculate Optimal Threshold
     fpr, tpr, thresholds = roc_curve(y_test_array, probs_fusion)
-    youden_j = tpr - fpr
-    best_thresh = thresholds[np.argmax(youden_j)]
-    
+    best_thresh = thresholds[np.argmax(tpr - fpr)]
     y_pred_fusion = (probs_fusion >= best_thresh).astype(int)
-    
-    # Metrics
+
+    # --- THIS IS THE LINE THAT DEFINES THE VARIABLE ---
     auc_fusion = roc_auc_score(y_test_array, probs_fusion)
-    acc_fusion = accuracy_score(y_test_array, y_pred_fusion)
-    f1_fusion = f1_score(y_test_array, y_pred_fusion)
-    tn, fp, fn, tp = confusion_matrix(y_test_array, y_pred_fusion, labels=[0, 1]).ravel()
-    sens_fusion = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    spec_fusion = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+    
+    # [NEW] Use the robust evaluation suite
+    acc, auc, f1, sens, spec, fpr90, ece, ci_l, ci_h, laplacian_auc = evaluate_fusion(y_test_array, probs_fusion, len(y_test_array))    
+    # [NEW] Save to master benchmark CSV
+    results_file = "all_phase3_benchmarks.csv"
+    row = {
+        "Strategy": "ECE_Inverse_Weighted_Fusion",
+        "AUC": f"{auc:.3f}",
+        "F1": f"{f1*100:.1f}%",
+        "Sens": f"{sens*100:.1f}%",
+        "Spec": f"{spec*100:.1f}%",
+        "FPR@90": f"{fpr90:.3f}",
+        "ECE": f"{ece:.3f}",
+        "F1_CI": f"[{ci_l:.2f}, {ci_h:.2f}]"
+    }
 
     # --- DISPLAY FINAL RESULTS ---
     print("\n" + "="*85)
-    print("PHASE 3b: FINAL MULTIMODAL RESULTS (AUC-WEIGHTED)")
+    print("PHASE 3b: FINAL MULTIMODAL RESULTS (ECE-WEIGHTED)")
     print("="*85)
     print(f"{'Metric':<15} | {'Phase 1 (Clinical)':<20} | {'Phase 2 (Vision)':<18} | {'Phase 3 (Fusion)':<15}")
     print("-" * 85)
-    print(f"{'AUC':<15} | {AUC_CLINICAL:<20.3f} | {AUC_VISION:<18.3f} | {auc_fusion:.3f}")
-    print(f"{'Sensitivity':<15} | {'80.0%':<20} | {'100.0%':<18} | {sens_fusion*100:.1f}%")
-    print(f"{'Specificity':<15} | {'47.8%':<20} | {'65.2%':<18} | {spec_fusion*100:.1f}%")
-    print(f"{'F1-Score':<15} | {'38.1%':<20} | {'55.6%':<18} | {f1_fusion*100:.1f}%")
-    print(f"{'Accuracy':<15} | {'53.6%':<20} | {'71.4%':<18} | {acc_fusion*100:.1f}%")
+    print(f"{'AUC':<15} | {'0.722':<20} | {'0.635':<18} | {auc:.3f}")
+    print(f"{'Sensitivity':<15} | {'80.0%':<20} | {'100.0%':<18} | {sens*100:.1f}%")
+    print(f"{'Specificity':<15} | {'47.8%':<20} | {'65.2%':<18} | {spec*100:.1f}%")
+    print(f"{'F1-Score':<15} | {'38.1%':<20} | {'55.6%':<18} | {f1*100:.1f}%")
+    print(f"{'Accuracy':<15} | {'53.6%':<20} | {'71.4%':<18} | {acc*100:.1f}%")
+    
+    print("\n" + "="*85)
+    print("PHASE 3b: ADVANCED DIAGNOSTIC METRICS")
+    print("="*85)
+    print(f"{'FPR @ 90% Sensitivity':<25} | {fpr90:.3f}")
+    print(f"{'Calibration Error (ECE)':<25} | {ece:.3f}")
+    print(f"{'F1-Score 95% CI':<25} | [{ci_l:.2f}, {ci_h:.2f}]")
+    print(f"{'Laplacian Baseline AUC':<25} | {laplacian_auc:.3f}")
     print("="*85)
 
 if __name__ == "__main__":

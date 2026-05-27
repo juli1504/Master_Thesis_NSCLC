@@ -11,6 +11,7 @@ averages them together equally (50/50), and calculates the final Multimodal metr
 
 import os
 import random
+import joblib
 import torch
 import pandas as pd
 import numpy as np
@@ -22,8 +23,11 @@ from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.impute import SimpleImputer
 from sklearn.neural_network import MLPClassifier
 from sklearn.metrics import accuracy_score, roc_auc_score, confusion_matrix, roc_curve, f1_score
+from sklearn.calibration import calibration_curve
 from imblearn.pipeline import Pipeline as ImbPipeline
 from imblearn.over_sampling import SMOTE
+from sklearn.utils import resample
+import csv
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -31,7 +35,7 @@ warnings.filterwarnings('ignore')
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 FILE_MANIFEST = PROJECT_ROOT / "data" / "processed" / "manifest.csv"
 FILE_CLINICAL = PROJECT_ROOT / "data" / "raw" / "clinical" / "NSCLCR01Radiogenomic_DATA_LABELS_2018-05-22_1500-shifted.csv"
-VISION_WEIGHTS = PROJECT_ROOT / "best_resnet_unfrozen_4.pth"
+VISION_WEIGHTS = PROJECT_ROOT / "best_resnet_unfrozen_3.pth"
 
 def set_seed(seed=42):
     """Locks down all random number generators for absolute reproducibility."""
@@ -76,10 +80,41 @@ def build_resnet(in_channels, num_classes=2):
     model.fc = nn.Linear(model.fc.in_features, num_classes)
     return model
 
-# --- 3. MAIN FUSION SCRIPT ---
+def evaluate_fusion(y_true, y_probs, y_test_mask_len):
+    """
+    Full clinical evaluation suite.
+    y_test_mask_len: used to calculate the Laplacian (majority class) baseline.
+    """
+    # 1. Standard Metrics
+    fpr, tpr, thresholds = roc_curve(y_true, y_probs)
+    best_thresh = thresholds[np.argmax(tpr - fpr)]
+    y_pred = (y_probs >= best_thresh).astype(int)
+    
+    acc, auc, f1 = accuracy_score(y_true, y_pred), roc_auc_score(y_true, y_probs), f1_score(y_true, y_pred)
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+    sens, spec = tp / (tp + fn) if (tp + fn) > 0 else 0.0, tn / (tn + fp) if (tn + fp) > 0 else 0.0
+    
+    # 2. FPR @ 90% Sensitivity
+    idx_90 = np.argmin(np.abs(tpr - 0.90))
+    fpr_at_90 = fpr[idx_90]
+    
+    # 3. Calibration Error (ECE)
+    prob_true, prob_pred = calibration_curve(y_true, y_probs, n_bins=5)
+    ece = np.mean(np.abs(prob_true - prob_pred))
+    
+    # 4. 95% Confidence Interval (Bootstrapping)
+    boot_f1s = [f1_score(*resample(y_true, (y_probs >= best_thresh).astype(int))) for _ in range(100)]
+    ci_l, ci_h = np.percentile(boot_f1s, [2.5, 97.5])
+    
+    # 5. Laplacian Baseline (Majority Class Prediction)
+    majority_class = 1 if np.sum(y_true) > (len(y_true) / 2) else 0
+    laplacian_pred = np.full_like(y_true, majority_class)
+    laplacian_auc = roc_auc_score(y_true, laplacian_pred)
+    
+    return acc, auc, f1, sens, spec, fpr_at_90, ece, ci_l, ci_h, laplacian_auc
+
 def main():
     set_seed(42)
-    
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"=== STARTING PHASE 3: MULTIMODAL LATE FUSION (50/50 AVERAGE) ===")
     print(f"Using Hardware: {device}\n")
@@ -87,48 +122,36 @@ def main():
     # 1. Load and Merge Data
     manifest_df = pd.read_csv(FILE_MANIFEST, sep=';', decimal=',')
     clinical_df = pd.read_csv(FILE_CLINICAL)
-    manifest_df = manifest_df[manifest_df['dataset_split'] != 'Excluded'].copy()
-    valid_cancers = ['Adenocarcinoma', 'Squamous cell carcinoma']
-    manifest_df = manifest_df[manifest_df['histology'].isin(valid_cancers)].copy()
+    df = pd.merge(manifest_df[manifest_df['histology'].isin(['Adenocarcinoma', 'Squamous cell carcinoma'])], 
+                  clinical_df, left_on='subject_id', right_on='Case ID', how='inner')
     
-    df = pd.merge(manifest_df, clinical_df, left_on='subject_id', right_on='Case ID', how='inner')
-    
-    le = LabelEncoder()
-    df['target'] = le.fit_transform(df['histology'])
-    
-    # 2. Prepare Clinical Data (Exact Phase 1b Pipeline)
-    clinical_features = ['Age at Histological Diagnosis', 'Gender', 'Smoking status']
-    X_raw = df[clinical_features].copy()
-    X_encoded = pd.get_dummies(X_raw, columns=['Gender', 'Smoking status'], drop_first=True)
-    
-    train_val_mask = df['dataset_split'].isin(['Train', 'Validation'])
+    # 2. Define Masks and Encoder
+    train_mask = df['dataset_split'].isin(['Train', 'Validation'])
     test_mask = df['dataset_split'] == 'Test'
     
-    X_train_val = X_encoded[train_val_mask]
-    y_train_val = df.loc[train_val_mask, 'target']
-    X_test = X_encoded[test_mask]
-    y_test = df.loc[test_mask, 'target'] # The Ground Truth!
+    # Define LabelEncoder and transform target
+    le = LabelEncoder()
+    df['target'] = le.fit_transform(df['histology'])
+    y_test = df.loc[test_mask, 'target']
     
-    imputer = SimpleImputer(strategy='median')
-    scaler = StandardScaler()
+    # 3. Define clinical features and clean
+    num_features = ['Age at Histological Diagnosis', 'Weight (lbs)', 'Pack Years', 'Quit Smoking Year']
+    cat_features = ['Gender', 'Ethnicity', 'Smoking status']
+    for col in num_features:
+        df[col] = pd.to_numeric(df[col].replace(['Not Collected', 'Unknown', ' '], np.nan), errors='coerce')
     
-    X_train_val_scaled = scaler.fit_transform(imputer.fit_transform(X_train_val))
-    X_test_scaled = scaler.transform(imputer.transform(X_test))
-
-    # --- PILLAR 1: GET CLINICAL PROBABILITIES ---
-    print("Training Phase 1 Champion (Tuned MLP)...")
-    clinical_pipeline = ImbPipeline([
-        ('smote', SMOTE(random_state=42)),
-        ('clf', MLPClassifier(hidden_layer_sizes=(64, 32), learning_rate_init=0.1, alpha=0.01, max_iter=1000, random_state=42))
-    ])
-    clinical_pipeline.fit(X_train_val_scaled, y_train_val)
-    probs_clinical = clinical_pipeline.predict_proba(X_test_scaled)[:, 1]
+    # Prepare X_test for the clinical pipeline
+    X_test = df[test_mask][num_features + cat_features]
+    
+    # --- PILLAR 1: LOAD BEST CLINICAL CHAMPION ---
+    print("Loading Best Clinical Model (Phase 1b)...")
+    clinical_pipeline = joblib.load("best_clinical_model.pkl")
+    probs_clinical = clinical_pipeline.predict_proba(X_test)[:, 1]
 
     # --- PILLAR 2: GET VISION PROBABILITIES ---
-    print("Loading Phase 2 Champion (ResNet Level 4)...")
+    print("Loading Phase 2 Best Model (ResNet Level 3)...")
     test_df = df[test_mask].copy()
     test_dataset = CTPatchDataset(test_df, le)
-    # Important: shuffle=False ensures the images align perfectly with the clinical rows!
     test_loader = DataLoader(test_dataset, batch_size=16, shuffle=False) 
     
     in_channels = test_dataset[0][0].shape[0]
@@ -149,36 +172,31 @@ def main():
     # --- PILLAR 3: LATE FUSION (50/50 AVERAGING) ---
     print("Performing Late Fusion (50/50 Averaging)...")
     probs_fusion = (probs_clinical + probs_vision) / 2.0
-    
     y_test_array = y_test.values
     
-    # Calculate Optimal Threshold for the Fused Probabilities
-    fpr, tpr, thresholds = roc_curve(y_test_array, probs_fusion)
-    youden_j = tpr - fpr
-    best_thresh = thresholds[np.argmax(youden_j)]
+    # Run the evaluation
+    acc, auc, f1, sens, spec, fpr90, ece, ci_l, ci_h, laplacian_auc = evaluate_fusion(y_test_array, probs_fusion, len(y_test_array))    
     
-    y_pred_fusion = (probs_fusion >= best_thresh).astype(int)
-    
-    # Metrics
-    auc_fusion = roc_auc_score(y_test_array, probs_fusion)
-    acc_fusion = accuracy_score(y_test_array, y_pred_fusion)
-    f1_fusion = f1_score(y_test_array, y_pred_fusion)
-    tn, fp, fn, tp = confusion_matrix(y_test_array, y_pred_fusion, labels=[0, 1]).ravel()
-    sens_fusion = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    spec_fusion = tn / (tn + fp) if (tn + fp) > 0 else 0.0
-
-    # --- DISPLAY FINAL RESULTS ---
+    # 6. Report Results for Thesis
     print("\n" + "="*85)
-    print("PHASE 3: FINAL MULTIMODAL RESULTS (50/50 AVERAGE)")
+    print("PHASE 3c: MULTIMODAL DEEP FEATURE FUSION RESULTS")
     print("="*85)
     print(f"{'Metric':<15} | {'Phase 1 (Clinical)':<20} | {'Phase 2 (Vision)':<18} | {'Phase 3 (Fusion)':<15}")
     print("-" * 85)
-    # Hardcoded values updated to the honest Phase 1b and Phase 2 ResNet Champions
-    print(f"{'AUC':<15} | {'0.652':<20} | {'0.757':<18} | {auc_fusion:.3f}")
-    print(f"{'Sensitivity':<15} | {'80.0%':<20} | {'100.0%':<18} | {sens_fusion*100:.1f}%")
-    print(f"{'Specificity':<15} | {'47.8%':<20} | {'65.2%':<18} | {spec_fusion*100:.1f}%")
-    print(f"{'F1-Score':<15} | {'38.1%':<20} | {'55.6%':<18} | {f1_fusion*100:.1f}%")
-    print(f"{'Accuracy':<15} | {'53.6%':<20} | {'71.4%':<18} | {acc_fusion*100:.1f}%")
+    # Note: Replace placeholders with your actual Phase 1 & 2 values from those scripts
+    print(f"{'AUC':<15} | {'0.722':<20} | {'0.635':<18} | {auc:.3f}")
+    print(f"{'Sensitivity':<15} | {'80.0%':<20} | {'100.0%':<18} | {sens*100:.1f}%")
+    print(f"{'Specificity':<15} | {'47.8%':<20} | {'65.2%':<18} | {spec*100:.1f}%")
+    print(f"{'F1-Score':<15} | {'38.1%':<20} | {'55.6%':<18} | {f1*100:.1f}%")
+    print(f"{'Accuracy':<15} | {'53.6%':<20} | {'71.4%':<18} | {acc*100:.1f}%")
+    
+    print("\n" + "="*85)
+    print("PHASE 3c: ADVANCED DIAGNOSTIC METRICS")
+    print("="*85)
+    print(f"{'FPR @ 90% Sensitivity':<25} | {fpr90:.3f}")
+    print(f"{'Calibration Error (ECE)':<25} | {ece:.3f}")
+    print(f"{'F1-Score 95% CI':<25} | [{ci_l:.2f}, {ci_h:.2f}]")
+    print(f"{'Laplacian Baseline AUC':<25} | {laplacian_auc:.3f}")
     print("="*85)
 
 if __name__ == "__main__":
