@@ -97,7 +97,7 @@ def main():
         df[col] = pd.to_numeric(df[col].replace(['Not Collected', 'Unknown', ' '], np.nan), errors='coerce')
     
     preprocessor = ColumnTransformer(transformers=[
-    ('num', SklearnPipeline([('imputer', KNNImputer(n_neighbors=5)), ('scaler', StandardScaler())]), num_features),
+    ('num', SklearnPipeline([('imputer', SimpleImputer(strategy='median')), ('scaler', StandardScaler())]), num_features),
     ('cat', SklearnPipeline([
         ('imputer', SimpleImputer(strategy='most_frequent')), 
         ('encoder', OneHotEncoder(sparse_output=False, handle_unknown='ignore'))

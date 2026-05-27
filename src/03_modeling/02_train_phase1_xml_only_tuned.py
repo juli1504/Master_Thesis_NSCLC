@@ -22,9 +22,10 @@ from xgboost import XGBClassifier
 from tabpfn import TabPFNClassifier
 from sklearn.metrics import accuracy_score, roc_auc_score, f1_score, roc_curve
 from sklearn.calibration import calibration_curve
-from sklearn.model_selection import GridSearchCV
+from sklearn.model_selection import GridSearchCV, cross_val_score
 from sklearn.utils import resample
 import joblib
+import optuna
 # This forces everything that uses joblib to run on a single core
 joblib.parallel_backend('sequential')
 
@@ -95,7 +96,30 @@ def evaluate_model_advanced(name, model, X_test, y_test, X_train, y_train):
         "Calib. Error": f"{calibration_score:.4f}"
     }
 
+def objective(trial, model_name, pipeline, X_train, y_train):
+    """Optuna objective: defines dynamic search space and CV evaluation."""
+    if model_name == "Tuned XGBoost":
+        params = {
+            'clf__n_estimators': trial.suggest_int('n_estimators', 50, 500),
+            'clf__max_depth': trial.suggest_int('max_depth', 3, 10),
+            'clf__learning_rate': trial.suggest_float('learning_rate', 1e-4, 0.1, log=True),
+            'clf__subsample': trial.suggest_float('subsample', 0.5, 1.0)
+        }
+    elif model_name == "Tuned MLP":
+        params = {
+            'clf__hidden_layer_sizes': trial.suggest_categorical('hidden_layer_sizes', [(64, 32), (32, 16), (128, 64)]),
+            'clf__learning_rate_init': trial.suggest_float('learning_rate_init', 1e-4, 1e-2, log=True),
+            'clf__alpha': trial.suggest_float('alpha', 1e-5, 1e-1, log=True)
+        }
+    else: # Default/LR
+        params = {'clf__C': trial.suggest_float('C', 0.01, 10.0, log=True)}
+        
+    pipeline.set_params(**params)
+    scores = cross_val_score(pipeline, X_train, y_train, cv=3, scoring='roc_auc')
+    return scores.mean()
+
 def main():
+    # 1. Data Loading and Cleaning
     manifest_df = pd.read_csv(FILE_MANIFEST, sep=';', decimal=',')
     clinical_df = pd.read_csv(FILE_CLINICAL)
     df = pd.merge(manifest_df, clinical_df, left_on='subject_id', right_on='Case ID', how='inner')
@@ -107,82 +131,59 @@ def main():
     for col in num_features:
         df[col] = pd.to_numeric(df[col].replace(['Not Collected', 'Unknown', ' '], np.nan), errors='coerce')
     
-    # Update the OrdinalEncoder inside your preprocessor:
+    # 2. Pipeline Definition
     preprocessor = ColumnTransformer(transformers=[
-    ('num', SklearnPipeline([('imputer', KNNImputer(n_neighbors=5)), ('scaler', StandardScaler())]), num_features),
-    ('cat', SklearnPipeline([
-        ('imputer', SimpleImputer(strategy='most_frequent')), 
-        ('encoder', OneHotEncoder(sparse_output=False, handle_unknown='ignore'))
-    ]), cat_features)
-])
+        ('num', SklearnPipeline([('imputer', SimpleImputer(strategy='median')), ('scaler', StandardScaler())]), num_features),
+        ('cat', SklearnPipeline([
+            ('imputer', SimpleImputer(strategy='most_frequent')), 
+            ('encoder', OneHotEncoder(sparse_output=False, handle_unknown='ignore'))
+        ]), cat_features)
+    ])
     
     X = df[num_features + cat_features]
     target_col = 'histology ' if 'histology ' in df.columns else 'Histology '
     y = LabelEncoder().fit_transform(df[target_col])
     
-    train_mask = df['dataset_split'] == 'Train'
-    test_mask = df['dataset_split'] == 'Test'
-    X_train, y_train, X_test, y_test = X[train_mask], y[train_mask], X[test_mask], y[test_mask]
+    X_train, y_train = X[df['dataset_split'] == 'Train'], y[df['dataset_split'] == 'Train']
+    X_test, y_test = X[df['dataset_split'] == 'Test'], y[df['dataset_split'] == 'Test']
     
-    models = {
-    "Tuned LR": (ImbPipeline([('prep', preprocessor), ('smote', SMOTE(random_state=42)), ('clf', LogisticRegression(random_state=42))]), {'clf__C': [0.1]}),
-    "Tuned XGBoost": (
-        ImbPipeline([
-            ('prep', preprocessor), 
-            ('smote', SMOTE(random_state=42)), 
-            ('clf', XGBClassifier(eval_metric='logloss', random_state=42))
-        ]), 
-        {
-            'clf__n_estimators': [100],
-            'clf__reg_alpha': [0.1, 1.0, 10.0],
-            'clf__reg_lambda': [0.1, 1.0, 10.0]
-        }
-    ),
-    "TabPFN": (SklearnPipeline([('prep', preprocessor), ('clf', TabPFNClassifier(device='cpu', model_path="03_modeling/tabpfn-v2.5-classifier-v2.5_default.ckpt"))]), {}),
-    # Wrap this in a tuple so it matches the (model, grid) structure
-    "Tuned MLP": (
-        ImbPipeline([('prep', preprocessor), ('smote', SMOTE(random_state=42)), ('clf', MLPClassifier(hidden_layer_sizes=(64, 32), learning_rate_init=0.01, alpha=0.01, max_iter=1000, random_state=42))]), 
-        {}
-    )}
-    
-    # 1. Generate the balanced training set
-    smote = SMOTE(random_state=42)
-    # We transform the data first to match the pipeline input
-    X_train_transformed = preprocessor.fit_transform(X_train)
-    X_train_b, y_train_b = smote.fit_resample(X_train_transformed, y_train)
+    # 3. Model Configurations
+    models_config = {
+        "Tuned LR": ImbPipeline([('prep', preprocessor), ('smote', SMOTE(random_state=42)), ('clf', LogisticRegression(random_state=42))]),
+        "Tuned XGBoost": ImbPipeline([('prep', preprocessor), ('smote', SMOTE(random_state=42)), ('clf', XGBClassifier(eval_metric='logloss', random_state=42))]),
+        "Tuned MLP": ImbPipeline([('prep', preprocessor), ('smote', SMOTE(random_state=42)), ('clf', MLPClassifier(max_iter=1000, random_state=42))])
+    }
 
-    # 2. Execution Loop
     results = []
     best_auc = 0.0
     best_model_overall = None
     
-    for name, (model, grid) in models.items():
-        if name == "TabPFN":
-            model.fit(X_train, y_train)
-            best_model = model
-        else:
-            gs = GridSearchCV(model, grid, cv=3, scoring='roc_auc', n_jobs=1)
-            gs.fit(X_train, y_train)
-            best_model = gs.best_estimator_
-            
-        # Evaluation
-        res = evaluate_model_advanced(name, best_model, X_test, y_test, X_train_b, y_train_b)
+    # 4. Optimization and Training Loop
+    for name, pipeline in models_config.items():
+        print(f"\n--- Optimizing {name} with Optuna ---")
+        study = optuna.create_study(direction='maximize')
+        study.optimize(lambda trial: objective(trial, name, pipeline, X_train, y_train), n_trials=30)
         
-        # Track best model based on AUC (converting string "0.XXX" to float)
-        current_auc = float(res["AUC"])
-        if current_auc > best_auc:
-            best_auc = current_auc
-            best_model_overall = best_model
-            print(f"New best model found: {name} (AUC: {best_auc:.3f})")
+        # Fit best model on the full training set
+        best_pipeline = pipeline
+        mapped_params = {f"clf__{k}": v for k, v in study.best_params.items()}
+        best_pipeline.set_params(**mapped_params)
+        best_pipeline.fit(X_train, y_train)
         
-        # Bootstrap CI (using single-threaded resample)
-        preds = best_model.predict(X_test)
+        # 5. Advanced Evaluation
+        res = evaluate_model_advanced(name, best_pipeline, X_test, y_test, X_train, y_train)
+        
+        # Bootstrap CI
+        preds = best_pipeline.predict(X_test)
         scores = [f1_score(*resample(y_test, preds)) for _ in range(500)]
         res["F1 95% CI"] = f"[{np.percentile(scores, 2.5):.2f}, {np.percentile(scores, 97.5):.2f}]"
         results.append(res)
         
+        if float(res["AUC"]) > best_auc:
+            best_auc, best_model_overall = float(res["AUC"]), best_pipeline
+            
         if name == "Tuned XGBoost": 
-            plot_feature_importance(best_model, num_features, cat_features, "feature_importance_1b")
+            plot_feature_importance(best_pipeline, num_features, cat_features, "feature_importance_1b")
 
     # 3. Save the best model after the loop finishes
     joblib.dump(best_model_overall, "best_clinical_model.pkl")
