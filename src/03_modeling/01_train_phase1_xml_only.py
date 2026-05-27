@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 import warnings
 
-from sklearn.preprocessing import StandardScaler, LabelEncoder, OrdinalEncoder
+from sklearn.preprocessing import StandardScaler, LabelEncoder, OrdinalEncoder, OneHotEncoder
 from sklearn.impute import KNNImputer, SimpleImputer
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline as SklearnPipeline
@@ -97,9 +97,12 @@ def main():
         df[col] = pd.to_numeric(df[col].replace(['Not Collected', 'Unknown', ' '], np.nan), errors='coerce')
     
     preprocessor = ColumnTransformer(transformers=[
-        ('num', SklearnPipeline([('imputer', KNNImputer(n_neighbors=5)), ('scaler', StandardScaler())]), num_features),
-        ('cat', SklearnPipeline([('imputer', SimpleImputer(strategy='most_frequent')), ('encoder', OrdinalEncoder(handle_unknown='use_encoded_value', unknown_value=-1))]), cat_features)
-    ])
+    ('num', SklearnPipeline([('imputer', KNNImputer(n_neighbors=5)), ('scaler', StandardScaler())]), num_features),
+    ('cat', SklearnPipeline([
+        ('imputer', SimpleImputer(strategy='most_frequent')), 
+        ('encoder', OneHotEncoder(sparse_output=False, handle_unknown='ignore'))
+    ]), cat_features)
+])
     
     X = df[num_features + cat_features]
     target_col = 'histology ' if 'histology ' in df.columns else 'Histology '
